@@ -10,7 +10,7 @@ waybill.workspace = true
 waybill-service-fs.workspace = true
 waybill-service-gdrive.workspace = true
 tokio.workspace = true
-oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
+oauth2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

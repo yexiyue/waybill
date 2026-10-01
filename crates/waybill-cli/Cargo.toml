@@ -1,0 +1,33 @@
+[package]
+name = "waybill-cli"
+description = "运单命令行工具：可恢复的云端投递"
+version.workspace = true
+edition.workspace = true
+# 宿主工具的 MSRV 高于库：ratatui-kit 0.10 精确锁定 ratatui 0.30.2，
+# 其模块化 crate 族声明 rustc 1.88。库与 service 仍承诺 1.85。
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wb"
+path = "src/main.rs"
+
+[dependencies]
+waybill.workspace = true
+waybill-service-fs.workspace = true
+waybill-service-gdrive.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+oauth2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+tempfile.workspace = true
+url.workspace = true
+clap.workspace = true
+directories.workspace = true
+ratatui-kit.workspace = true
+
+[dev-dependencies]
