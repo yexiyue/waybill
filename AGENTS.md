@@ -32,10 +32,9 @@ service-fs 提供稳定源和 checkpoint，service-gdrive 提供上传与对账�
 | `assets/brand/` / `docs/BRAND.zh-CN.md` | Bill 吉祥物与品牌资产 |
 | `.github/workflows/ci.yml` | Linux 与 macOS 的 Rust CI |
 
-Rust edition 为 **2024**，库与 service 声明的 MSRV 为 **1.85**，许可证为
-**MIT OR Apache-2.0**。`waybill-cli` 是宿主工具，单独声明 MSRV **1.88**
-（ratatui-kit 0.10 精确锁定 ratatui 0.30.2，其依赖族要求 1.88）；
-CI 的 1.85 检查因此只覆盖库成员。新增依赖、语言特性和工具链配置须注意这一分界。
+Rust edition 为 **2024**，rust-version 统一为 **1.88**（2026-10-01 起，跟随
+ratatui 等依赖族的实际下限，不再维护更低的 MSRV 承诺或独立检查），
+许可证为 **MIT OR Apache-2.0**。新增依赖与工具链配置以此为下限。
 
 ## 架构约束
 
@@ -98,9 +97,9 @@ cargo test --workspace
 ```
 
 需要格式化时使用 `cargo fmt --all`。现有 CI 在 Linux 与 macOS 上执行
-fmt、Clippy 和测试；它使用 stable 工具链，并以 Rust 1.85 检查库成员
-（CLI 的 ratatui 依赖链要求 1.88，由 stable 覆盖），尚无浏览器验收任务。
-不要把现有 CI 通过描述为所有 target、MSRV 或真实后端均已验证。
+fmt、Clippy、测试与 rustdoc，使用 stable 工具链；不设独立 MSRV 检查
+（rust-version 1.88 由依赖解析保证），尚无浏览器验收任务。
+不要把现有 CI 通过描述为所有 target 或真实后端均已验证。
 
 真实后端验证需记录环境与能力，区分本地契约验证和服务端验收。
 恢复逻辑尤其关注进程中断、完成响应丢失、源版本变化和发布失败窗口。

@@ -407,7 +407,7 @@ flowchart LR
 ```
 
 M1 交付独立库与公开 API 消费者示例，不替换 SwarmDrop 主线。首期验证 Linux / macOS，
-MSRV 1.85。API 仍为 0.x 原型；完整稳定化须经过双向链路与更多后端验证。
+rust-version 1.88（2026-10-01 起统一，不再维护更低版本）。API 仍为 0.x 原型；完整稳定化须经过双向链路与更多后端验证。
 真实 GDrive 重启、会话过期及完成响应丢失测试与本地 HTTP 替身测试分别记录。
 
 ## 8. 与 OpenDAL 的关系（三重）
@@ -519,7 +519,8 @@ capability 原样复制为所有交付能力。
 `crates/storage-cloud/src/{gdrive,staging,persistence,publish}`。MIT 来源声明随衍生代码保留。
 只复用协议和恢复机制，不复制设备目录、接收记录模型、CloudAccountManager 或 UI 类型。
 SwarmDrop 的 17 MiB 真机探针确认正常分块上传、属性查询及重复接收复用；重启、过期、
-完成响应丢失尚未验收。目录源码的 let chains 需改写以兼容 Rust 1.85。
+完成响应丢失尚未验收。目录源码的 let chains 当时为兼容 Rust 1.85 改写；
+2026-10-01 起 rust-version 统一为 1.88，新代码可直接使用 let chains。
 
 本轮源码复核：本机缓存 OpenDAL core 0.59.2 的 MultipartWriter 上传 ID 为私有状态；
 [公开 GDrive backend](https://opendal.apache.org/docs/rust/src/opendal_service_gdrive/backend.rs.html)

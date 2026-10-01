@@ -125,7 +125,7 @@ Bill 是一只带着运单筒的邮差鸿雁，中文叫 **雁哥**。双向迁�
 本地故障测试及真实 Drive 上传、重启恢复已通过，范围与缺口见
 [验收记录](docs/VALIDATION.zh-CN.md)。长期 API 草图还会调整。
 
-工作区使用 **Rust 2024**，声明的最低 Rust 版本为 **1.85**。检查当前实现：
+工作区使用 **Rust 2024**，声明的最低 Rust 版本为 **1.88**。检查当前实现：
 
 ```sh
 cargo check --workspace --all-targets --locked

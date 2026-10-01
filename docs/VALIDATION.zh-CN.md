@@ -12,7 +12,7 @@ checkpoint、跨进程对账与完成回执；下载 service、本地发布与 S
 | macOS 26.6.2 / arm64 / Rust 1.98.1 | fmt、all-targets check、Clippy `-D warnings`、test、rustdoc `-D warnings` 通过 |
 | macOS / arm64 / Rust 1.85.0 | all-targets check、test 通过 |
 | Debian bookworm Linux 容器 / aarch64 / Rust 1.85.0 | fmt、all-targets check、Clippy `-D warnings`、test、rustdoc `-D warnings` 通过 |
-| GitHub Actions | 已配置 Linux / macOS stable 与 1.85 门禁；未提交，未运行远端 CI |
+| GitHub Actions | 已配置 Linux / macOS stable 门禁（2026-10-01 起不再维护独立 MSRV 检查）；未提交，未运行远端 CI |
 
 Linux 在本机 OrbStack 中运行官方 `rust:1.85.0-bookworm`，镜像摘要
 `sha256:0ff31c9ffa641a62e48d543fb00b4960955ea375f40776f40f585b89e654cc5e`；

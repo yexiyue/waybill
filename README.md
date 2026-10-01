@@ -143,7 +143,7 @@ especially useful at this stage. Local fault tests and live Drive upload / proce
 recovery have passed; see the [validation record](docs/VALIDATION.zh-CN.md) for the
 exact scope and remaining gaps.
 
-The workspace uses **Rust 2024**, with a declared minimum Rust version of **1.85**.
+The workspace uses **Rust 2024**, with a declared minimum Rust version of **1.88**.
 To check the current implementation:
 
 ```sh
