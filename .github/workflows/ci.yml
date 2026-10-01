@@ -31,5 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85.0
-      - run: cargo check --workspace --all-targets --locked
-      - run: cargo test --workspace --locked
+      # 库与 service 承诺 1.85；waybill-cli 是宿主工具，
+      # 其 ratatui 0.30 依赖链要求 1.88，由上方 stable 覆盖。
+      - run: cargo check --locked --all-targets -p waybill -p waybill-service-fs -p waybill-service-gdrive -p waybill-consumer-example
+      - run: cargo test --locked -p waybill -p waybill-service-fs -p waybill-service-gdrive -p waybill-consumer-example
