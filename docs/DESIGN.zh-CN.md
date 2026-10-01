@@ -497,10 +497,12 @@ capability 原样复制为所有交付能力。
 
 本节描述 M1 实现约束，§5 中 Operator / registry 等草图属于长期设计，不是既有 API。
 
-- 核心仅定义开放 Service、Source、UploadSink、CheckpointStore、资源预算与上传状态机。
-  公共异步返回 Send boxed future，不绑定 Tokio、HTTP、本地路径或应用身份。
-- service-fs 首期提供稳定文件源、精确范围读取、BLAKE3 身份和文件 checkpoint；下载
-  Sink / 随机写暂存 / 最终发布尚未实现。宿主必须在上传期间冻结源文件。
+- 核心定义开放 Service、Source、UploadSink、CheckpointStore、资源预算与上传、下载
+  状态机。公共异步返回 Send boxed future，不绑定 Tokio、HTTP、本地路径或应用身份；
+  引擎内并发调度仅引入执行器无关的 futures-util，运行时仍归宿主。
+- service-fs 提供稳定文件源、精确范围读取、BLAKE3 身份、文件 checkpoint，以及下载
+  本地目标（`.part` 随机写、MD5 / BLAKE3 校验、同盘原子发布）。宿主必须在上传期间
+  冻结源文件。
 - service-gdrive 使用短期凭证端口；OAuth 和刷新持久化由宿主负责。实例绑定账户、
   OAuth 应用与根目录。使用通用操作 ID，默认拒绝同名目标；显式选择可加操作后缀另存。
 - checkpoint 公共格式版本与驱动私有格式版本分别验证，绑定源、目标与实例。先保存
@@ -525,7 +527,7 @@ capability 原样复制为所有交付能力。
 `oauth` 负责桌面 PKCE、回环回调和 Google 身份查询；`credentials` 原子保存应用与
 token 并拥有刷新。账户别名只用于本机凭证目录，service 命名空间使用实际 Google
 `permissionId`，因此同一别名改绑账户不能复用旧恢复状态。CLI 请求 `drive.file` + `drive.readonly`，前者上传本应用文件，后者为后续云盘列表与
-下载提供只读权限；列表选择与下载仍待 M2。`gdrive_host` 将其与 OAuth
+下载提供只读权限，`wb get` / `wb list` 已随 M2 落地。`gdrive_host` 将其与 OAuth
 应用、根目录组装成实例，具体 Drive 协议仍归 service。仅 `drive.file` 的真机授权下读取
 `files/root` 返回 404；默认根通过 [v2 about.rootFolderId](https://developers.google.com/workspace/drive/api/reference/rest/v2/about)
 解析真实 ID（2026-10-01 已验证），无需扩大 scope；显式根 ID 保留可访问性与目录校验。
@@ -535,8 +537,45 @@ CLI 保留带回执的完成 checkpoint 作为本机幂等记录，不在输出�
 删除本机完成记录后不保证重复投递自动跳过：当前 service 不跨操作搜索远端回执。
 上传期间仍要求消费者冻结源文件；文件版本变化按公开契约明确拒绝。
 
+### M2 下载与本地发布（2026-10-01 实现，真机验收待补）
+
+核心 `download` 模块与上传镜像：`DownloadSource` 提供廉价元数据复核
+（`RemoteIdentity`：对象引用、不透明 revision、长度、可选服务端摘要）与有界
+范围读取；`DownloadTarget` 按生命周期划分 `prepare / probe / initialize /
+write_chunk / verify / publish`。`write_chunk` 按精确偏移寻址且不要求调用
+顺序——乱序容忍是目标契约属性，引擎调度只是使用者。能力位新增
+`range_download / random_write / durable_publish`，开始前显式拒绝，不降级。
+
+引擎以 `FuturesUnordered` 做有界并行补洞：各流领取最小缺失区间，并发与
+缓冲受 `chunk × concurrency` 预算约束；`write_chunk` 由引擎串行调用，区间
+在写入并同步落盘后才记入公共信封账本（合并有序，上限 4096 条）。单流失败
+留洞返回，已记账区间保留；全部收齐后先校验（服务端 md5 / BLAKE3 全文件
+哈希，无摘要仅长度并按 `Verification` 分级声明）再发布；发布失败保留
+`.part` 与已校验状态，重跑只做发布。`.part` 丢失而目标存在时，probe 以
+已校验状态或对目标重算摘要复原回执（发布成功未记账窗口）。
+
+checkpoint 信封升 v2：`flow` 标签区分上传 / 下载记录，v1 平铺上传记录由
+service-fs 存储层在解码前包一层上传流兼容加载，下次保存升级；两种方向共用
+同一操作租约与存储目录。回执新增 `verified` 验证级别；上传回执携带源
+BLAKE3 证据，下载回执按实际校验声明。
+
+service-gdrive 下载侧：`files/{id}?alt=media` 精确 Range 读取（206 必须精确
+回显区间；200 仅接受全文件请求，超长即协议错误；416 映射 SourceChanged）。
+媒体重定向手动跟随 Google HTTPS 白名单（googleapis / drive.google /
+*.googleusercontent，最多五跳），跨源不携带凭证。revision 复合
+`version:md5:size`；Google 原生文档（无二进制内容）明确拒绝。`resolve`
+按配置根解析路径（中间段必须目录、同名多义拒绝），`list` 列目录直接子项。
+
+CLI：`wb get <SRC-URI> <DEST>` 解析路径后驱动引擎（目标为已存在目录时展开
+远端文件名；预检先于凭证加载）；`wb list <DIR-URI>` 目录浏览；`status`
+按信封方向分列展示，下载行汇总区间账本。下载默认操作 ID 由实例、对象
+引用、源版本与本地目标联合派生：远端更新即新运单。本地跨盘发布（EXDEV）
+明确不支持，不自动降级为复制。
+
 抽取基线：SwarmDrop `0a81f133214958f7b01ae9a0e4624dc87e16014b`，
-`crates/storage-cloud/src/{gdrive,staging,persistence,publish}`。MIT 来源声明随衍生代码保留。
+`crates/storage-cloud/src/{gdrive,staging,persistence,publish}` 与
+`crates/host-fs/src/local_fs/{part_file,sink_ops}`（M2 的 `.part` 机制来源）。
+MIT 来源声明随衍生代码保留。
 只复用协议和恢复机制，不复制设备目录、接收记录模型、CloudAccountManager 或 UI 类型。
 SwarmDrop 的 17 MiB 真机探针确认正常分块上传、属性查询及重复接收复用；重启、过期、
 完成响应丢失尚未验收。目录源码的 let chains 当时为兼容 Rust 1.85 改写；

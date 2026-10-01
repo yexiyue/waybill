@@ -16,11 +16,13 @@
   <a href="https://github.com/yexiyue/waybill/actions/workflows/ci.yml">CI</a>
 </p>
 
-> **Early development · M1 upload recovery prototype, unpublished.** Public upload
-> contracts, stable local sources, file checkpoints, GDrive resumable uploads and
-> reconciliation, and an independent consumer example are implemented. Downloads
-> and local publication remain planned. Local fault tests and live Google acceptance
-> are reported separately in [validation notes](docs/VALIDATION.zh-CN.md).
+> **Early development · M2 download prototype, unpublished.** Public upload and
+> download contracts, stable local sources, file checkpoints, GDrive resumable
+> uploads and reconciliation, GDrive ranged downloads with `.part` recovery and
+> atomic local publication, and an independent consumer example are implemented.
+> Download-side acceptance is local so far; live Google acceptance is pending.
+> Local fault tests and live Google upload acceptance are reported separately in
+> [validation notes](docs/VALIDATION.zh-CN.md).
 
 ## Delivery that can pick up where it stopped
 
@@ -69,8 +71,8 @@ variant or changing the engine.
 
 | Service / status | Role |
 |---|---|
-| waybill-service-fs · prototype | Stable local sources, range reads, BLAKE3 validation, and file checkpoints; download publication is planned |
-| waybill-service-gdrive · prototype | Google Drive uploads, resumable sessions, and completion reconciliation |
+| waybill-service-fs · prototype | Stable local sources, range reads, BLAKE3 validation, file checkpoints, and the local download target (`.part` staging, verification, atomic publication) |
+| waybill-service-gdrive · prototype | Google Drive uploads, resumable sessions, completion reconciliation, and ranged downloads with path resolution |
 | waybill-service-webdav · planned | Streaming uploads, range downloads, and declared server capabilities |
 | waybill-service-oss · planned | Aliyun OSS access, multipart sessions, and part reconciliation |
 | External service crates | Additional backends using the same public extension contracts |
@@ -110,9 +112,9 @@ sync, conflict merging, and multi-device synchronization are outside that scope.
 | Milestone | Planned outcome |
 |---|---|
 | **M0** | Open contracts and versioned checkpoints |
-| **M1 — current** | Stable local sources, GDrive upload recovery, and independent consumer integration |
-| **CLI — in progress** | The `wb` command line (login / put / status): GDrive upload loop with a fullscreen dashboard and a `--json` event stream; downloads and MCP wait for M2+ |
-| **M2** | GDrive downloads, local staging, recovery and publication |
+| **M1 — done** | Stable local sources, GDrive upload recovery, and independent consumer integration (real-Drive accepted) |
+| **CLI — in progress** | The `wb` command line (login / put / get / list / status): GDrive upload and download loops with a fullscreen dashboard and a `--json` event stream |
+| **M2 — in progress** | GDrive downloads, local staging, recovery and publication (locally validated; real-Drive acceptance pending) |
 | **M3** | WebDAV and a real-server compatibility matrix |
 | **M4** | OSS multipart recovery and completion reconciliation |
 | **On demand** | OpenDAL adapter, starting with a concrete additional backend and its download path |
@@ -127,18 +129,24 @@ contracts remain independent of its UI, device identity, and P2P protocol.
 ```sh
 cargo run -p waybill-cli -- login gdrive --client /path/to/desktop.json
 cargo run -p waybill-cli -- put ./file.zip 'gdrive://account@example.com/backup/'
+cargo run -p waybill-cli -- list 'gdrive://account@example.com/backup/'
+cargo run -p waybill-cli -- get 'gdrive://account@example.com/backup/file.zip' ./file.zip
 cargo run -p waybill-cli -- status
 ```
 
 Authorization requests `drive.file` for app-owned uploads and `drive.readonly`
-for reading Drive files; file browsing and downloads remain planned.
-Login uses your Google email as the account name; `--account` sets a local alias.
-Multiple sources require a destination ending in `/`. Directories must belong to
-this app, or use `--root <folder ID>` for an app-accessible root. A TTY opens the
-fullscreen dashboard; `--no-tui` selects plain output and `--json` streams events.
-The first Ctrl-C stops gracefully; the second aborts immediately. Rerun the same
-command to resume or reuse the completed receipt. `status` lists pending and
-completed records. Removing local completion records removes the skip guarantee.
+for reading Drive files. Login uses your Google email as the account name;
+`--account` sets a local alias. Multiple sources require a destination ending in
+`/`. Directories must belong to this app, or use `--root <folder ID>` for an
+app-accessible root. `list` browses Drive folders; `get` fetches a file — an
+existing directory destination takes the remote file name, and a remote update
+starts a fresh waybill. Downloads verify the server-provided MD5, publish
+atomically on the same filesystem, and reject cross-device destinations.
+A TTY opens the fullscreen dashboard; `--no-tui` selects plain output and
+`--json` streams events. The first Ctrl-C stops gracefully; the second aborts
+immediately. Rerun the same command to resume or reuse the completed receipt.
+`status` lists pending and completed records per direction. Removing local
+completion records removes the skip guarantee.
 
 ## Meet Bill
 

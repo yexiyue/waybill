@@ -16,9 +16,11 @@
   <a href="https://github.com/yexiyue/waybill/actions/workflows/ci.yml">CI</a>
 </p>
 
-> **早期开发 · M1 上传恢复原型，未发布。** 已实现开放上传契约、本地稳定源与文件
-> checkpoint、GDrive 分块上传和恢复对账，以及独立消费者示例。下载与本地发布尚未实现。
-> 本地故障测试与真实 Google 验收分别记录，见 [验收记录](docs/VALIDATION.zh-CN.md)。
+> **早期开发 · M2 下载原型，未发布。** 已实现开放上传与下载契约、本地稳定源与
+> 文件 checkpoint、GDrive 分块上传和恢复对账、GDrive 范围读取下载与 `.part`
+> 恢复及本地原子发布，以及独立消费者示例。下载侧验收目前为本地分层验证，
+> 真机验收待补。本地故障测试与真实 Google 上传验收分别记录，见
+> [验收记录](docs/VALIDATION.zh-CN.md)。
 
 ## 让交付可以接着完成
 
@@ -62,8 +64,8 @@ provider 枚举，也不需要等待主仓库收录。
 
 | service / 状态 | 职责 |
 |---|---|
-| waybill-service-fs · 原型 | 本地稳定源、范围读取、BLAKE3 核验和文件 checkpoint；下载发布后续实现 |
-| waybill-service-gdrive · 原型 | Google Drive 上传、偏移续传、会话与完成对象对账 |
+| waybill-service-fs · 原型 | 本地稳定源、范围读取、BLAKE3 核验、文件 checkpoint，以及下载本地目标（`.part` 暂存、校验、原子发布） |
+| waybill-service-gdrive · 原型 | Google Drive 上传、偏移续传、会话与完成对象对账，以及范围读取下载与路径解析 |
 | waybill-service-webdav · 计划 | 流式上传、范围下载与服务端能力差异 |
 | waybill-service-oss · 计划 | 阿里云 OSS 访问、分片上传与已完成分片对账 |
 | 外部 service crate | 使用相同公开契约接入其他后端 |
@@ -97,8 +99,8 @@ OpenDAL 适配器由实际额外后端需求触发，优先验证下载：范围
 |---|---|
 | **M0** | 开放契约与版本化 checkpoint |
 | **M1 · 当前** | 本地稳定源 + GDrive 上传恢复，独立消费者接入 |
-| **CLI · 开发中** | `wb` 运单命令行（login / put / status）：GDrive 上传闭环，全屏面板 + `--json` 事件流；下载与 MCP 待 M2 后 |
-| **M2** | GDrive 下载与本地暂存、恢复和发布 |
+| **CLI · 开发中** | `wb` 运单命令行（login / put / get / list / status）：GDrive 上传与下载闭环，全屏面板 + `--json` 事件流 |
+| **M2 · 实现中** | GDrive 下载与本地暂存、恢复和发布（本地验收通过，真机验收待补） |
 | **M3** | WebDAV 与真实服务端兼容矩阵 |
 | **M4** | OSS 分片恢复与完成对账 |
 | **按需扩展** | OpenDAL 适配器，从具体额外后端的下载路径开始 |
@@ -112,15 +114,20 @@ OpenDAL 适配器由实际额外后端需求触发，优先验证下载：范围
 ```sh
 cargo run -p waybill-cli -- login gdrive --client /path/to/desktop.json
 cargo run -p waybill-cli -- put ./file.zip 'gdrive://account@example.com/backup/'
+cargo run -p waybill-cli -- list 'gdrive://account@example.com/backup/'
+cargo run -p waybill-cli -- get 'gdrive://account@example.com/backup/file.zip' ./file.zip
 cargo run -p waybill-cli -- status
 ```
 
-授权包含 `drive.file`（上传本应用文件）和 `drive.readonly`（读取云盘文件）；
-文件列表与下载仍待后续实现。登录默认用 Google 邮箱作为账户名，可用 `--account` 指定别名。多文件投递的目标
+授权包含 `drive.file`（上传本应用文件）和 `drive.readonly`（读取云盘文件）。
+登录默认用 Google 邮箱作为账户名，可用 `--account` 指定别名。多文件投递的目标
 以 `/` 结尾；目录必须由该应用创建，或显式指定应用可访问的 `--root <目录 ID>`。
+`list` 浏览云盘目录；`get` 取回文件，目标为已存在目录时使用远端文件名，
+远端更新即视为新运单。下载校验服务端 md5，本地同盘原子发布，跨盘目标明确拒绝。
 TTY 默认显示全屏面板，`--no-tui` 使用行式输出，`--json` 输出实时 JSON 事件。
 Ctrl-C 首次优雅停止、再次立即中止；重跑同一命令续传或复用完成回执。
-完成记录保存在本机，`status` 同时显示在途与已完成记录；删除记录后不保证幂等跳过。
+完成记录保存在本机，`status` 按上传 / 下载方向显示在途与已完成记录；
+删除记录后不保证幂等跳过。
 
 ## 认识 Bill · 雁哥
 
@@ -136,8 +143,8 @@ Bill 是一只带着运单筒的邮差鸿雁，中文叫 **雁哥**。双向迁�
 
 ## 参与开发
 
-从 [设计文档](docs/DESIGN.zh-CN.md) 开始。当前公开 API 为上传原型；
-本地故障测试及真实 Drive 上传、重启恢复已通过，范围与缺口见
+从 [设计文档](docs/DESIGN.zh-CN.md) 开始。当前公开 API 为上传与下载原型；
+本地故障测试及真实 Drive 上传验收已通过，下载侧完成本地分层验收（真机待补），范围与缺口见
 [验收记录](docs/VALIDATION.zh-CN.md)。长期 API 草图还会调整。
 
 工作区使用 **Rust 2024**，声明的最低 Rust 版本为 **1.88**。检查当前实现：

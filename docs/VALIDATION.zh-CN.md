@@ -101,6 +101,37 @@ JSON 实时刷新、事件／记录资源上界和 TUI 键位行为。CLI 按实
 Clippy `-D warnings`、workspace test 和 rustdoc `-D warnings` 在本机通过。
 本轮未重新执行 Linux 验证、真实会话自然过期或服务端故障注入，不扩大原有平台结论。
 
+## M2 下载与本地发布本地验收（2026-10-01）
+
+本轮基线为 `8e16296..a9ca88c`（核心、gdrive、fs、CLI 四次提交）。范围为 GDrive
+下载侧：核心下载契约与并行引擎、范围读取与路径解析、`.part` 暂存 / 校验 /
+发布、`wb get` / `wb list` 与双方向 `status`。全部为本机分层验收，
+**未执行真实 Google 下载，未宣称真机通过**。
+
+环境为本机 macOS / arm64、Rust 1.98.1。fmt、workspace all-targets check、
+Clippy `-D warnings`、workspace test 与 rustdoc `-D warnings` 在本机通过；
+未重新执行 Linux 容器验证，不扩大平台结论。
+
+工作区普通测试共 96 项（CLI 30、GDrive 29、core 19〔下载引擎 16 + 预算 3〕、
+fs 16〔下载目标 11 + 持久化 4 + 源 1〕、只读消费者与探针入口 2）；另有两个
+ignored 子进程辅助入口（gdrive 上传恢复、fs 锁互斥）与一个新增 fs 下载恢复
+子进程辅助，均由父测试明确执行。
+
+| 层 | 实际验证 |
+|---|---|
+| 核心引擎 | 乱序到达合并为单区间、在途读取受预算并发约束、写入先于账本记账（事件序断言）、单流失败留洞且重取、两阶段停止（收齐后仍不发布）、能力不足前置拒绝、空文件零读取 |
+| 恢复语义 | 预置区间账本跳过已持久区间、源 revision 变化拒绝且记录保留、digest 不符保留暂存不重下、v1 平铺上传记录兼容加载并在下次保存升级 v2、上传记录不能驱动下载操作 |
+| 发布窗口 | 发布失败保留 `.part` 且重跑零读取只重发布、已校验状态不重复校验、目标位置被占的迟到冲突先拒绝、回执落盘失败后经目标位置对账复原回执 |
+| GDrive 协议 | 206 Content-Range 精确回显、200 仅接受全文件请求（超长拒绝）、416 映射 SourceChanged、404 映射 NotFound、媒体重定向白名单 + 跨源不携带凭证（替身断言请求头）、version:md5:size 复合 revision、原生文档与回收站拒绝、路径解析同名多义拒绝、目录列表字段映射 |
+| fs 目标 | 乱序 pwrite 精确偏移、`.part` 预分配长度不构成完成证据、暂存截断整体重建、已记账区间被篡改由终态摘要拦截、操作后缀稳定命名且重跑幂等、跨进程子进程加载同一 checkpoint 与 `.part` 续传完成 |
+| CLI | get/list 参数形态、源 URI 与目标形态预检先于凭证加载、远端文件名本地消毒、下载操作 ID 绑定源版本与本地目标、`status` 双方向分列且 v1 记录可读 |
+
+checkpoint 信封升级 v2（`flow` 方向标签）；v1 记录由 service-fs 解码层包壳
+兼容，含真实文件存储的加载-升级-重载回归。回执新增 `verified` 验证级别
+（上传携带源 BLAKE3，下载按 md5 / 长度分级）。核心生产依赖树新增执行器无关
+的 futures-util（并发调度）；tokio 与 serde_json 仅为核心测试 dev 依赖。
+service-fs 新增 RustCrypto md-5 用于与 Drive md5Checksum 对账。
+
 ## 资源样本
 
 环境为上述 macOS / arm64、debug 构建、单路上传、Google Drive、当时本机网络；
@@ -124,6 +155,8 @@ Tokio 文件 IO 内部复制缓冲限制为 256 KiB；该收紧经两平台测�
 - 在真实 Drive 会话自然过期后验收默认暂停和显式重建；补充真实网络层完成响应丢失。
 - 补充双路上传、长时运行与更多网络 / 文件系统环境的资源样本。
 - SwarmDrop 正式回接另立 OpenSpec；本期仅同步 D3 的 staged_complete 设计及孵化记录。
-- 下载及本地最终发布进入 M2；WebDAV、OSS 和按需 OpenDAL 后移。
+- 下载与本地发布已完成本地分层验收；真实 Drive 的 get / list、并行下载、
+  断点恢复、md5 对账与发布冲突真机验收待补，完成后 M2 才能宣称结束。
+  WebDAV、OSS 和按需 OpenDAL 后移。
 - waybill 本轮改动已按用户授权提交；未推送、未发布或声明稳定 API。
   SwarmDrop 侧原有未提交改动保持原状。

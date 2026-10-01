@@ -1,7 +1,7 @@
 # service 开发与宿主接入
 
-当前接口为 0.x 上传原型；架构与兼容策略以 DESIGN.zh-CN.md §11 为准。
-下载、Operator、registry 与配置工厂仍属后续设计。
+当前接口为 0.x 上传与下载原型；架构与兼容策略以 DESIGN.zh-CN.md §11 为准。
+Operator、registry 与配置工厂仍属后续设计。
 
 ## 公开边界
 
@@ -23,11 +23,34 @@ Tokio 属于原生 service 与宿主；核心的 Send 约束尚不代表浏览�
 最小实现只支持 Source；核心当前上传引擎要求 durable offset upload，其他写入模式
 明确拒绝，后续按实际后端增加契约，不为 OSS / WebDAV 写默认成功的假实现。
 
+## 下载源与本地目标
+
+下载方向与上传入口对称：`Service::download_source(reference)` 打开云端源，
+`Service::download_target()` 返回本地目标。核心 `DownloadEngine::run(source,
+target, store, DownloadOptions)` 驱动；上传与下载共用操作 ID、checkpoint 存储、
+错误分类与停止信号，`confirm` 以回执清理记录。
+
+`DownloadSource` 每次调用 `identity()` 都应反映服务端最新元数据（宿主不冻结
+云对象）；`read_range` 返回恰好 length 字节。`DownloadTarget` 责任划分：
+
+1. `prepare` 只决定目标侧状态（如冲突后缀名），不创建暂存文件。
+2. `probe` 对账 `.part` 与目标位置；发布窗口（目标已存在、回执未落盘）在此
+   复原回执，长度不符按冲突处理。
+3. `initialize` 创建或重建 `.part`；账本清零后旧内容全部作废。
+4. `write_chunk` 在精确偏移写入并同步，不要求调用顺序；返回后区间才可记账。
+5. `verify` 按服务端摘要全文件校验；无摘要仅核对长度，回执声明较低级别。
+6. `publish` 同盘原子发布并同步父目录；失败保留暂存，重跑只做发布。
+
+`.part` 预分配长度，长度不构成完成证据；完成度以公共信封的区间账本为准。
+本地目标当前仅 Linux / macOS；跨设备发布（EXDEV）明确拒绝，不自动复制。
+service-fs 的 `LocalTarget` 实现上述契约；Google 原生文档没有二进制内容，
+下载源按 InvalidInput 拒绝，不退化为导出。
+
 ## 源、恢复与完成
 
 源文件须由宿主冻结，`FileSource` 核验内容哈希、文件版本及路径身份；每块读取
 前后检查文件元信息，恢复和返回成功前重新核验内容。不对恶意并发修改者提供快照保证。
-源 reference 是路径摘要，公共端口不承载原生路径。source-fs 尚无下载 Sink。
+源 reference 是路径摘要，公共端口不承载原生路径。
 
 检查点绑定公共格式版本、源、目标、操作 ID 和 service 实例。操作 ID 须跨进程稳定。
 未知公共 / 驱动版本、源变化、目标或实例不匹配均保留记录并返回明确错误。
