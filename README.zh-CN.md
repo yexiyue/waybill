@@ -16,8 +16,9 @@
   <a href="https://github.com/yexiyue/waybill/actions/workflows/ci.yml">CI</a>
 </p>
 
-> **早期开发 · M0 契约设计阶段。** 当前仓库包含 Rust 工作区骨架和设计文档，
-> 尚无公开传输 API、已实现的 service 或 crates.io 发布版本。以下介绍的是计划能力。
+> **早期开发 · M1 上传恢复原型，未发布。** 已实现开放上传契约、本地稳定源与文件
+> checkpoint、GDrive 分块上传和恢复对账，以及独立消费者示例。下载与本地发布尚未实现。
+> 本地故障测试与真实 Google 验收分别记录，见 [验收记录](docs/VALIDATION.zh-CN.md)。
 
 ## 让交付可以接着完成
 
@@ -51,25 +52,30 @@ flowchart LR
     E --> CP[Checkpoint 存储]
 ```
 
-核心计划定义 Service、Source、Sink、能力模型、checkpoint、凭证端口与调度。
+核心已提供 Service、Source、UploadSink、能力、checkpoint 与上传调度。
+GDrive 的短期 token 端口属于该 service；授权和刷新由宿主负责。
 每个 service 通过公开契约实现一个后端。
 
 **我们维护的 service 与其他开发者编写的 service 使用同一套扩展边界。**
 开发者可以独立发布 crate，依赖 waybill，由消费者直接注入，不需要修改核心
 provider 枚举，也不需要等待主仓库收录。
 
-| 计划中的 service | 职责 |
+| service / 状态 | 职责 |
 |---|---|
-| waybill-service-fs | 本地区间读写、暂存、持久化与最终发布 |
-| waybill-service-gdrive | Google Drive 对象访问、偏移续传与会话对账 |
-| waybill-service-webdav | 流式上传、范围下载与服务端能力差异 |
-| waybill-service-oss | 阿里云 OSS 访问、分片上传与已完成分片对账 |
+| waybill-service-fs · 原型 | 本地稳定源、范围读取、BLAKE3 核验和文件 checkpoint；下载发布后续实现 |
+| waybill-service-gdrive · 原型 | Google Drive 上传、偏移续传、会话与完成对象对账 |
+| waybill-service-webdav · 计划 | 流式上传、范围下载与服务端能力差异 |
+| waybill-service-oss · 计划 | 阿里云 OSS 访问、分片上传与已完成分片对账 |
 | 外部 service crate | 使用相同公开契约接入其他后端 |
 
-只读 service 可以直接参与；上传与持久恢复按需实现。计划提供最小示例、完整会话
-示例及按能力运行的契约验收工具，降低扩展成本。详见
-[公开扩展契约](docs/DESIGN.zh-CN.md#57-第三方-service-的公开扩展契约)。
-API 名称和签名仍在设计中。
+只读 service 可以直接参与；上传与持久恢复按需实现。现有
+[独立消费者示例](examples/consumer/) 展示公开契约接入，
+[service 开发指南](docs/SERVICE.zh-CN.md) 说明实际接口与验收要求。
+API 仍是 0.x 原型，设计中的 Operator / registry 草图不是当前接口。
+
+首期使用 `UploadEngine`，同一操作重试先核验源、实例和远端状态。会话过期默认返回
+`SessionExpired`，保留 checkpoint；消费者显式允许后最多重建两次。
+完成回执先落盘，业务记账之后才调用 `confirm` 清理记录。源文件由宿主冻结并保留。
 
 ## 与现有存储库协作
 
@@ -83,16 +89,17 @@ OpenDAL 适配器由实际额外后端需求触发，优先验证下载：范围
 每个 service 声明实际保证。WebDAV MOVE、确定性对象键或 ETag 本身，不能统一
 证明发布原子性、内容完整性或跨后端 exactly-once。
 
-首期聚焦本地与云端之间的文件交付，目录同步、冲突合并与多设备同步不在首期范围。
+首期实现本地到 GDrive 的上传，长期聚焦本地与云端之间的文件交付，目录同步、冲突合并与多设备同步不在首期范围。
 
 ## 路线图
 
 | 阶段 | 计划结果 |
 |---|---|
-| **M0 · 当前** | 公开扩展契约、能力模型、checkpoint 信封与最小 service 示例 |
-| **M1** | 本地 + Drive，验证双向恢复与独立消费者接入 |
-| **M2** | WebDAV 与真实服务端兼容矩阵 |
-| **M3** | OSS 分片恢复与完成对账 |
+| **M0** | 开放契约与版本化 checkpoint |
+| **M1 · 当前** | 本地稳定源 + GDrive 上传恢复，独立消费者接入 |
+| **M2** | GDrive 下载与本地暂存、恢复和发布 |
+| **M3** | WebDAV 与真实服务端兼容矩阵 |
+| **M4** | OSS 分片恢复与完成对账 |
 | **按需扩展** | OpenDAL 适配器，从具体额外后端的下载路径开始 |
 
 首个计划消费者是 [SwarmDrop](https://github.com/swarm-apps/SwarmDrop)。其已有本地
@@ -113,13 +120,15 @@ Bill 是一只带着运单筒的邮差鸿雁，中文叫 **雁哥**。双向迁�
 
 ## 参与开发
 
-从 [设计文档](docs/DESIGN.zh-CN.md) 开始。当前阶段适合讨论公开 service 边界、
-恢复行为与真实后端约束。设计中的 API 草图还会调整。
+从 [设计文档](docs/DESIGN.zh-CN.md) 开始。当前公开 API 为上传原型；
+本地故障测试及真实 Drive 上传、重启恢复已通过，范围与缺口见
+[验收记录](docs/VALIDATION.zh-CN.md)。长期 API 草图还会调整。
 
-工作区使用 **Rust 2024**，声明的最低 Rust 版本为 **1.85**。检查当前骨架：
+工作区使用 **Rust 2024**，声明的最低 Rust 版本为 **1.85**。检查当前实现：
 
 ```sh
-cargo check --workspace
+cargo check --workspace --all-targets --locked
+cargo test --workspace --locked
 ```
 
 ## 许可证

@@ -1,7 +1,7 @@
 # waybill 设计文档 —— 云端与本地之间的可恢复双向传输
 
 > 起于 2026-10-01 的孵化讨论（源头是 SwarmDrop issue #132 的三后端集成），同日建仓。
-> 状态：🟢 **已立项开工 —— M0 契约设计阶段**
+> 状态：🟢 **M1 原型开发 —— GDrive 上传与持久恢复，未发布**
 > 仓库：<https://github.com/yexiyue/waybill>
 > 命名：`waybill`（运单）——回执、在途追踪与交付凭证合一；crates.io 已核未占用
 > （`portage` 被 Gentoo 占用出局；`wildgoose` 有 wild-goose-chase 习语陷阱）。
@@ -34,7 +34,7 @@ multipart API 已公开上传 ID，值得参考；这里的缺口需要按具体
 `host-fs` 的通用文件部分进入独立库的本地后端；身份、配对、设备配置和
 SwarmDrop 业务适配继续留在应用。当前可复用素材是已落地的 Google Drive
 实现与本地文件实现，WebDAV / OSS 仍是计划。市场需求与后端验收需要 spike
-验证；当前仓库处于 M0 契约设计阶段，三后端与双向传输引擎尚未实现。
+验证；首期实现本地稳定源到 GDrive 的上传恢复原型；下载、本地发布、WebDAV 与 OSS 后移。真实故障恢复需独立验收，不继承 SwarmDrop 正常上传探针的结论。
 
 ## 1. 动机：三要件是怎么被逼出来的
 
@@ -213,7 +213,7 @@ OpenDAL 桥接层只暴露实际支持的能力，不统一假定所有后端不
 
 | crate | 职责 | 依赖 |
 |---|---|---|
-| waybill | Service / Source / Sink 契约、capability、访问入口、传输状态机与调度、进度、CheckpointStore、凭证端口、结构化错误 | 不依赖 service、SwarmDrop、HTTP 或本地文件实现 |
+| waybill | Service / Source / Sink 契约、capability、访问入口、传输状态机与调度、进度、CheckpointStore、结构化错误；凭证端口属于具体 service | 不依赖 service、SwarmDrop、HTTP 或本地文件实现 |
 | waybill-service-fs | 本地范围读取、随机写入、暂存、同步与最终发布 | core + 原生文件实现，按 target / feature 隔离 |
 | waybill-service-gdrive | Drive 对象访问、偏移上传会话与恢复对账 | core + HTTP / 协议依赖 |
 | waybill-service-webdav | WebDAV 访问、流式上传、服务端差异与可选分块扩展 | core + WebDAV / HTTP 依赖 |
@@ -243,7 +243,7 @@ flowchart TB
 ```
 
 独立库的公共契约不依赖 SwarmDrop、Tauri、Specta、收件箱或设备身份模型。
-端口与状态机保持平台中立；原生执行器先落地，浏览器的存储、权限与持久化
+端口与状态机保持平台中立；原生 service 先落地，浏览器的存储、权限与持久化
 保证单独声明，不能把 native-only 实现包装成所有 target 都可用。
 
 模块按 object、upload、download、checkpoint、credential、drivers 等职责组织，
@@ -292,7 +292,7 @@ flowchart TB
 它们已实现本地范围读取、精确偏移写入、`.part` 重开与发布；完整的下载
 恢复 / 校验链路仍需新增。
 
-| 抽取到 service-fs | 保留在 SwarmDrop |
+| 后续抽取到 service-fs（首期仅稳定源与 checkpoint） | 保留在 SwarmDrop |
 |---|---|
 | 范围读取、按偏移写入、暂存创建 / 重开、同步、发布与清理 | 身份、配对设备、设备配置的 JSON 存储 |
 | 通用路径边界检查与目标冲突策略 | FileAccess 端口适配、CoreSaveLocation 和 UI 选址 |
@@ -341,7 +341,7 @@ core 私有模块、特殊分支或后门。外部开发者应能创建一个只
 - **写入模式分开扩展**：偏移、分片、整文件与本地随机写遵循各自契约。
   支持新后端可复用现有模式；出现新的传输语义时，通过演进核心契约承载。
 
-两种接入方式，以下为 API 草图，签名待 M0 设计：
+两种接入方式，以下为 API 草图，为长期规划，首期接口见 §11：
 
 ```rust
 // Rust 应用直接使用外部 crate，只依赖公开 service 契约
@@ -361,7 +361,7 @@ let service = registry.build(&config, &host_context).await?;
 core、service 契约及公共信封使用明确的版本兼容规则，新增能力通过独立可选
 契约或兼容的默认 Unsupported 演进；稳定版破坏性修改提升主版本，0.x 阶段
 明确次版本兼容边界与迁移说明。具体 Rust trait
-的异步形式、类型擦除方式与跨 target 约束在 M0 定，确保配置构造出的实例
+的异步形式、类型擦除方式与跨 target 约束首期采用对象安全 boxed future，确保配置构造出的实例
 也能注入引擎，避免只有编译期泛型路径可用。
 
 ### 5.8 第三方 service 的开发与验收入口
@@ -393,27 +393,22 @@ core、service 契约及公共信封使用明确的版本兼容规则，新增�
 
 ```mermaid
 flowchart LR
-    M0["M0 开放 Service / Source / Sink 契约\n能力、checkpoint 与外部实现示例"] --> M1["M1 service-fs + service-gdrive\n双向恢复与独立消费者接入"]
-    M1 --> M2["M2 WebDAV\n整文件流式上传、范围下载、真机矩阵"]
-    M2 --> M3["M3 OSS\n分片并发、ListParts、恢复与完成对账"]
-    M3 --> BACK["SwarmDrop 接回新库\n本地 / 云读取与发布端口适配"]
-    NEED["首个额外后端的实际需求"] -.-> OD["可选 service-opendal\n优先验证云端下载"]
-    M1 -.-> OD
+    M0["M0 开放契约与 checkpoint"] --> M1["M1 本地稳定源 → GDrive
+上传、重启对账、完成回执"]
+    M1 --> M2["M2 GDrive 下载
+.part 恢复与本地发布"]
+    M2 --> M3["M3 WebDAV
+流式上传与真实服务端矩阵"]
+    M3 --> M4["M4 OSS
+分片恢复与完成对账"]
+    M1 -.-> APP["SwarmDrop 正式回接
+另立 OpenSpec"]
+    NEED["额外后端的实际需求"] -.-> OD["可选 OpenDAL service"]
 ```
 
-要点：
-
-- **M1 的最小完整链路是 Drive 对象下载到本地 `.part`，重启恢复后完成发布**，
-  同时验证本地文件上传到 Drive。发布失败重试与源版本变更必须纳入契约验收。
-- **API 稳定化至少经过 Drive + WebDAV 两个云后端以及本地 Sink**。两种上传
-  恢复策略与双向链路共同检验抽象，M3 再用 OSS 检验乱序分片和完成对账。
-- **扩展性从 M0 建立，M1 验收**：独立消费者通过公开 core 契约使用各 service；
-  官方与外部实现共享边界，不允许靠修改核心枚举或私有 helper 接入后端。
-- 抽取时持续使用 SwarmDrop 已有 Drive 与本地实现作为素材；应用主线不等待
-  独立库全量完成。每个可用里程碑后的应用接入另立 OpenSpec 变更。
-- M2 的真机矩阵复用 issue #132 的验收需求；OpenDAL 覆盖多个后端仍需逐项
-  声明能力，不能把桥接成功等同于持久恢复验收通过。
-- OpenDAL 桥接由额外后端需求触发；应用接入与核心 API 稳定化不等待它完成。
+M1 交付独立库与公开 API 消费者示例，不替换 SwarmDrop 主线。首期验证 Linux / macOS，
+MSRV 1.85。API 仍为 0.x 原型；完整稳定化须经过双向链路与更多后端验证。
+真实 GDrive 重启、会话过期及完成响应丢失测试与本地 HTTP 替身测试分别记录。
 
 ## 8. 与 OpenDAL 的关系（三重）
 
@@ -488,12 +483,52 @@ capability 原样复制为所有交付能力。
   M0 契约稳定后尽早 `cargo publish` 占名。
 - **建仓与首期范围**：~~尚未创建仓库~~ **已建仓**（本仓库）。独立 Cargo
   workspace，core 与各 service 独立成包；以 service-fs + service-gdrive
-  验证双向链路及外部接入，再按 WebDAV → OSS 接入；OpenDAL 桥接按实际需求触发。
+  验证上传恢复及外部接入，再按 GDrive 下载 → WebDAV → OSS 接入；OpenDAL 桥接按实际需求触发。
 - **checkpoint 状态格式**：不透明 blob 的版本化策略（库升级后旧 state 能否
-  restore）——M0 设计时定。
+  restore）——首期公共信封与驱动均使用版本 1，未知版本拒绝恢复并保留记录。
 - **校验与冲突策略**：来源缺少可信预期哈希时如何向消费者表达保证；同名目标
   的拒绝 / 覆盖 / 重命名规则；跨盘与外部文档提供方的发布回执如何对账。
-- **平台范围**：首期原生实现支持的平台、SAF / Web 适配时机与能力边界待定。
-- **公开扩展签名**：Service / 工厂接口的异步与类型擦除方案、公共错误与
-  checkpoint 信封的兼容规则在 M0 确定；示例与验收工具作为 service SDK 文档。
+- **平台范围**：首期原生实现为 Linux / macOS；SAF / Web 适配时机与能力边界待定。
+- **公开扩展签名**：首期采用开放 trait 和 Send boxed future；工厂 / registry 后续设计。
+  0.x API 仍可演进，破坏性变更须升次版本并提供迁移说明。
 - **SwarmDrop 回切时机**：M1 后可评估局部接入，完整接入另立 OpenSpec 变更。
+
+## 11. 首期落实契约与源码证据（2026-10-01）
+
+本节描述 M1 实现约束，§5 中 Operator / registry 等草图属于长期设计，不是既有 API。
+
+- 核心仅定义开放 Service、Source、UploadSink、CheckpointStore、资源预算与上传状态机。
+  公共异步返回 Send boxed future，不绑定 Tokio、HTTP、本地路径或应用身份。
+- service-fs 首期提供稳定文件源、精确范围读取、BLAKE3 身份和文件 checkpoint；下载
+  Sink / 随机写暂存 / 最终发布尚未实现。宿主必须在上传期间冻结源文件。
+- service-gdrive 使用短期凭证端口；OAuth 和刷新持久化由宿主负责。实例绑定账户、
+  OAuth 应用与根目录。使用通用操作 ID，默认拒绝同名目标；显式选择可加操作后缀另存。
+- checkpoint 公共格式版本与驱动私有格式版本分别验证，绑定源、目标与实例。先保存
+  对象 ID 再初始化上传；远端完成后先保存回执，消费者确认记账后才清理恢复记录。
+- 会话过期先查完成对象；未完成默认返回 SessionExpired 并保留记录。显式允许
+  重建时每次运行最多两次，进度表达重新开始。暂停停止后续块，先对账在途结果。
+- 默认上传块 8 MiB，共享预算最多两条上传、16 MiB 数据缓冲；校验块 256 KiB，
+  单个元数据响应及 checkpoint 上限 1 MiB，元数据列表最多 1000 项。无目录缓存。
+  HTTP 超时 60 秒；限流 / 5xx 最多三次重试、单次等待最多 30 秒。上传 PUT
+  结果未知后先查偏移，不盲目重发；初始化 POST 使用已持久化 ID 收敛重试。
+- 文件 checkpoint 以 0600 临时文件、同步、替换、目录同步落盘；操作锁覆盖整个
+  恢复和确认过程。源、凭证、私有状态不写 Debug / 日志。hash 属性是操作对账证据，
+  不证明远端内容完整性，也不承诺跨进程并发同名目标的统一原子发布。
+
+抽取基线：SwarmDrop `0a81f133214958f7b01ae9a0e4624dc87e16014b`，
+`crates/storage-cloud/src/{gdrive,staging,persistence,publish}`。MIT 来源声明随衍生代码保留。
+只复用协议和恢复机制，不复制设备目录、接收记录模型、CloudAccountManager 或 UI 类型。
+SwarmDrop 的 17 MiB 真机探针确认正常分块上传、属性查询及重复接收复用；重启、过期、
+完成响应丢失尚未验收。目录源码的 let chains 需改写以兼容 Rust 1.85。
+
+本轮源码复核：本机缓存 OpenDAL core 0.59.2 的 MultipartWriter 上传 ID 为私有状态；
+[公开 GDrive backend](https://opendal.apache.org/docs/rust/src/opendal_service_gdrive/backend.rs.html)
+使用 OneShotWriter（网站源码未固定发布版本，不外推所有版本）。
+[object_store 公开 multipart 源码](https://github.com/apache/arrow-rs-object-store/blob/main/src/multipart.rs)
+提供低层上传 ID，但不直接提供本项目 checkpoint 编排；首期均不作为依赖。
+[Google resumable 协议](https://developers.google.com/workspace/drive/api/guides/manage-uploads)
+定义 308 偏移查询、404 过期与非末块 256 KiB 对齐。
+未在本轮重新核验的 §3 其他库版本、CLI 市场数据及占名状态保留原日期，仅作历史调研。
+
+waybill 独立库的本轮分层验收见 [VALIDATION.zh-CN.md](VALIDATION.zh-CN.md)：
+本地 HTTP 故障替身与真实 Drive 验收分别记录，不继承上游探针的故障恢复结论。

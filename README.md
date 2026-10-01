@@ -16,10 +16,11 @@
   <a href="https://github.com/yexiyue/waybill/actions/workflows/ci.yml">CI</a>
 </p>
 
-> **Early development · M0 contract design.** This repository currently contains
-> a Rust workspace scaffold and design documentation. There is no public transfer
-> API, implemented service, or crates.io release yet. The capabilities below
-> describe the intended design.
+> **Early development · M1 upload recovery prototype, unpublished.** Public upload
+> contracts, stable local sources, file checkpoints, GDrive resumable uploads and
+> reconciliation, and an independent consumer example are implemented. Downloads
+> and local publication remain planned. Local fault tests and live Google acceptance
+> are reported separately in [validation notes](docs/VALIDATION.zh-CN.md).
 
 ## Delivery that can pick up where it stopped
 
@@ -56,8 +57,9 @@ flowchart LR
     Engine --> Checkpoint[Checkpoint store]
 ```
 
-The planned core defines Service, Source, and Sink contracts, capabilities,
-checkpoints, credentials, and transfer scheduling. Each service implements a
+The core provides Service, Source, UploadSink, capabilities, checkpoints and upload
+scheduling. GDrive owns its short-lived token interface; the host owns authorization
+and refresh. Each service implements a
 backend through those public contracts.
 
 **The services maintained here use the same extension boundary as services
@@ -65,21 +67,24 @@ written by other developers.** An external service should be able to live in its
 own crate, depend on waybill, and be injected without adding a provider enum
 variant or changing the engine.
 
-| Planned service | Role |
+| Service / status | Role |
 |---|---|
-| waybill-service-fs | Local range reads, offset writes, staging, persistence, and final publication |
-| waybill-service-gdrive | Google Drive access and resumable upload sessions |
-| waybill-service-webdav | Streaming uploads, range downloads, and declared server capabilities |
-| waybill-service-oss | Aliyun OSS access, multipart sessions, and part reconciliation |
+| waybill-service-fs · prototype | Stable local sources, range reads, BLAKE3 validation, and file checkpoints; download publication is planned |
+| waybill-service-gdrive · prototype | Google Drive uploads, resumable sessions, and completion reconciliation |
+| waybill-service-webdav · planned | Streaming uploads, range downloads, and declared server capabilities |
+| waybill-service-oss · planned | Aliyun OSS access, multipart sessions, and part reconciliation |
 | External service crates | Additional backends using the same public extension contracts |
 
-A read-only service can participate without implementing uploads. Durable
-recovery is an optional contract with explicit requirements. Shared examples
-and capability-driven conformance tools are planned to make service development
-easier.
+A read-only service can participate without implementing uploads. The
+[independent consumer](examples/consumer/) uses only public APIs; the
+[service guide](docs/SERVICE.zh-CN.md) describes the implemented contracts.
+APIs are 0.x prototypes. Operator and registry sketches remain design material.
 
-See the [extension design](docs/DESIGN.zh-CN.md#57-第三方-service-的公开扩展契约).
-API names and signatures are still under design.
+`UploadEngine` validates the source, instance, and remote state before resuming.
+Expired sessions return `SessionExpired` and retain their checkpoint by default.
+Explicit permission permits at most two restarts per run. Receipts are persisted
+before success; call `confirm` only after committing host bookkeeping. The host
+must freeze the source and owns its cleanup.
 
 ## Working with the Rust storage ecosystem
 
@@ -96,17 +101,19 @@ alone does not establish universal atomicity, content integrity, or exactly-once
 delivery. The [design document](docs/DESIGN.zh-CN.md) records the research and
 proposed boundaries.
 
-The initial scope is file delivery between local and cloud storage. Directory
+The initial implementation uploads local files to GDrive; the long-term scope is
+file delivery between local and cloud storage. Directory
 sync, conflict merging, and multi-device synchronization are outside that scope.
 
 ## Roadmap
 
 | Milestone | Planned outcome |
 |---|---|
-| **M0 — current** | Public extension contracts, capabilities, checkpoint envelope, and minimal service examples |
-| **M1** | Local + Drive services; upload and download recovery; independent consumer integration |
-| **M2** | WebDAV service and a real-server compatibility matrix |
-| **M3** | OSS service; multipart recovery and completion reconciliation |
+| **M0** | Open contracts and versioned checkpoints |
+| **M1 — current** | Stable local sources, GDrive upload recovery, and independent consumer integration |
+| **M2** | GDrive downloads, local staging, recovery and publication |
+| **M3** | WebDAV and a real-server compatibility matrix |
+| **M4** | OSS multipart recovery and completion reconciliation |
 | **On demand** | OpenDAL adapter, starting with a concrete additional backend and its download path |
 
 The first intended consumer is
@@ -131,13 +138,16 @@ social cover, and generation prompts.
 
 Start with the [design document](docs/DESIGN.zh-CN.md). Contributions around the
 public service boundary, recovery behavior, and real backend constraints are
-especially useful at this stage.
+especially useful at this stage. Local fault tests and live Drive upload / process
+recovery have passed; see the [validation record](docs/VALIDATION.zh-CN.md) for the
+exact scope and remaining gaps.
 
 The workspace uses **Rust 2024**, with a declared minimum Rust version of **1.85**.
-To check the current scaffold:
+To check the current implementation:
 
 ```sh
-cargo check --workspace
+cargo check --workspace --all-targets --locked
+cargo test --workspace --locked
 ```
 
 Please discuss a service's capabilities and recovery guarantees before building

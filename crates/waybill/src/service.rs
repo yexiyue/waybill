@@ -1,0 +1,90 @@
+//! 开放 service 标识与按实例声明的能力。
+use crate::{
+    BoxFuture,
+    error::{Error, ErrorKind, Result},
+    source::Source,
+    upload::UploadSink,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+/// 开放命名空间标识，避免核心 provider 枚举。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ServiceId(String);
+impl ServiceId {
+    /// 接受 `namespace:name`，最长 128 字节，小写 ASCII 与 `-._`。
+    pub fn parse(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let valid = value
+            .split_once(':')
+            .is_some_and(|(ns, name)| !ns.is_empty() && !name.is_empty() && !name.contains(':'))
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b":-._".contains(&c));
+        if !valid {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid service id"));
+        }
+        Ok(Self(value))
+    }
+    /// 返回规范标识。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for ServiceId {
+    type Error = Error;
+    fn try_from(value: String) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+impl std::str::FromStr for ServiceId {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
+impl From<ServiceId> for String {
+    fn from(value: ServiceId) -> Self {
+        value.0
+    }
+}
+/// 恢复绑定的后端与账户 / 端点 / 根目录实例。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceIdentity {
+    /// 后端标识。
+    pub service: ServiceId,
+    /// 稳定且不含凭证的宿主命名空间。
+    pub instance: String,
+}
+/// 当前实例的首期能力，不外推浏览器或其他后端。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Capabilities {
+    /// 稳定范围读源。
+    pub range_source: bool,
+    /// 支持连续偏移上传。
+    pub offset_upload: bool,
+    /// 支持服务端会话对账与跨进程恢复。
+    pub durable_upload: bool,
+}
+/// service 元信息。
+#[derive(Debug, Clone)]
+pub struct ServiceInfo {
+    /// 实例身份。
+    pub identity: ServiceIdentity,
+    /// 已实现能力。
+    pub capabilities: Capabilities,
+}
+/// 外部 crate 可直接实现；读取与上传入口独立且默认明确拒绝。
+pub trait Service: Send + Sync {
+    /// 返回实例能力。
+    fn info(&self) -> ServiceInfo;
+    /// 以 service 自己解释的对象引用打开源。
+    fn source<'a>(&'a self, _reference: &'a str) -> BoxFuture<'a, Arc<dyn Source>> {
+        Box::pin(async { Err(Error::new(ErrorKind::Unsupported, "source unavailable")) })
+    }
+    /// 获取上传契约；最小只读 service 无需实现。
+    fn upload_sink(&self) -> Result<Arc<dyn UploadSink>> {
+        Err(Error::new(ErrorKind::Unsupported, "upload unavailable"))
+    }
+}

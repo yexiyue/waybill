@@ -1,39 +1,17 @@
-//! # waybill
+//! 可恢复交付的开放契约与上传状态机。
 //!
-//! 云端与本地之间的**可恢复双向交付**：上传 / 下载会话可跨进程恢复，重试按回执
-//! 幂等收敛，发布有原子边界。名字取自「运单」——回执、在途追踪与交付凭证合一。
-//!
-//! ## 与访问层的关系
-//!
-//! OpenDAL / object_store 是统一的对象**访问**层，价值在一套 API 抹平后端差异；
-//! waybill 是可靠的**交付**层，假设进程会死、网络会断、用户会重试，价值在把
-//! 后端差异**类型化**为诚实降级的能力矩阵，而不是假装所有后端行为一致。
-//!
-//! ## 三要件
-//!
-//! | 要件 | 含义 |
-//! |---|---|
-//! | 元数据幂等 | 以回执键（receipt key）查重，命中即视为已完成；批量部分失败重试自动跳过已传项 |
-//! | 传输恢复 | 会话状态可持久化，崩溃重启后先对账已确认区间再续传，不重传整个文件 |
-//! | 内存上界 | 源 / 目标一律区间读写，禁止无界缓冲 |
-//!
-//! ## 能力模型（类型化降级）
-//!
-//! 传输恢复：`Durable`（会话可恢复，如 Drive resumable / OSS multipart）·
-//! `Restart`（协议天花板，重试重传，如普通 WebDAV）· `Unsupported`；
-//! 幂等对账：元数据回执 · 确定性对象键 · 服务端条件操作；发布：同文件系统重命名 ·
-//! 远端完成操作 · 复制。调用方按矩阵决策，库在能力不足时于开始前明确拒绝。
-//!
-//! ## 状态
-//!
-//! **M0 契约设计阶段**——本 crate 尚无公共 API。`Service` / `Source` / `Sink`
-//! 契约、capability、checkpoint 信封与凭证端口的设计见
-//! [`docs/DESIGN.zh-CN.md`](https://github.com/yexiyue/waybill/blob/main/docs/DESIGN.zh-CN.md) §5，
-//! 签名细节在设计定稿后落地。明确不做：双向同步引擎（bisync）、OpenDAL API
-//! 兼容层、多语言绑定。
-//!
-//! 吉祥物：**Bill**，一只腿绑运单筒的邮差鸿雁——春秋双向迁徙（双向传输）、
-//! 湿地落脚补给（checkpoint）、年年归同一个巢（回执幂等）、人字雁阵轮流领飞
-//!（分片并发）。
-
+//! 首期仅提供稳定 Source 到 UploadSink 的上传。下载与本地发布尚未实现。
+//! service 拥有协议和 IO，宿主拥有授权、源文件冻结与业务记账。
+//! 完成回执持久化后才能成功返回；会话过期默认保留记录并暂停。
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+pub mod checkpoint;
+pub mod error;
+pub mod service;
+pub mod source;
+pub mod upload;
+
+use std::{future::Future, pin::Pin};
+/// 可对象化且不绑定执行器的异步端口；原生首期要求 Send。
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = error::Result<T>> + Send + 'a>>;

@@ -7,7 +7,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# M0：契约设计阶段，无外部依赖。Service / Source / Sink 契约、capability
-# 模型与 checkpoint 信封按 docs/DESIGN.zh-CN.md §5 在本 crate 落地；
-# 各后端以独立的 waybill-service-* crate 按里程碑加入，此处不预留空包。
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
