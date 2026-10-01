@@ -147,7 +147,7 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
 }
 
 /// 首次 Ctrl-C 优雅停止；再次按下中止任务并保留最近持久记录。
-fn install_ctrl_c(stop: StopToken, abort: tokio::task::AbortHandle) {
+pub(crate) fn install_ctrl_c(stop: StopToken, abort: tokio::task::AbortHandle) {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             stop.stop();
@@ -158,7 +158,7 @@ fn install_ctrl_c(stop: StopToken, abort: tokio::task::AbortHandle) {
     });
 }
 
-fn paused() -> CliError {
+pub(crate) fn paused() -> CliError {
     CliError::Waybill(Error::new(
         ErrorKind::Paused,
         "stopped; rerun the same command to resume",

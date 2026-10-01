@@ -35,6 +35,10 @@ pub enum Command {
     },
     /// 投递文件到云端；重跑同一命令即续传或按回执幂等跳过。
     Put(PutArgs),
+    /// 从云端取回文件到本地；重跑同一命令即续传或按回执幂等跳过。
+    Get(GetArgs),
+    /// 列出云盘目录内容。
+    List(ListArgs),
     /// 列出本机恢复记录与已完成回执。
     Status,
 }
@@ -67,6 +71,40 @@ pub struct PutArgs {
 pub enum Provider {
     /// Google Drive（读取云盘文件，创建和修改本应用文件）。
     Gdrive,
+}
+
+/// 文件取回参数；源为云盘路径，目标为本地文件或目录。
+#[derive(Args)]
+pub struct GetArgs {
+    /// 源 URI，如 gdrive://account@example.com/backup/a.zip
+    #[arg(value_name = "SRC-URI")]
+    pub source: String,
+    /// 本地目标文件路径；为已存在目录时使用远端文件名。
+    #[arg(value_name = "DEST")]
+    pub dest: PathBuf,
+    /// 覆盖默认操作 ID（默认由实例、源版本与目标推导）。
+    #[arg(long, value_name = "ID")]
+    pub operation: Option<String>,
+    /// 同名本地目标冲突策略。
+    #[arg(long, value_enum, default_value_t = Conflict::Reject)]
+    pub conflict: Conflict,
+    /// Drive 根目录对象 ID；缺省为 root。
+    #[arg(long, value_name = "ID")]
+    pub root: Option<String>,
+    /// 禁用全屏面板，使用行式输出（非终端自动生效）。
+    #[arg(long)]
+    pub no_tui: bool,
+}
+
+/// 目录列表参数。
+#[derive(Args)]
+pub struct ListArgs {
+    /// 目录 URI，如 gdrive://account@example.com/backup/；根目录可省略路径。
+    #[arg(value_name = "DIR-URI")]
+    pub uri: String,
+    /// Drive 根目录对象 ID；缺省为 root。
+    #[arg(long, value_name = "ID")]
+    pub root: Option<String>,
 }
 
 /// 同名目标冲突策略，映射库的 ConflictPolicy。
@@ -131,5 +169,34 @@ mod tests {
         assert_eq!(args.sources, vec![PathBuf::from("a"), PathBuf::from("b")]);
         assert_eq!(args.dest, "gdrive://bill/backup/");
         assert!(args.no_tui);
+    }
+
+    #[test]
+    fn get_takes_source_uri_then_local_destination() {
+        let cli = Cli::try_parse_from([
+            "wb",
+            "get",
+            "gdrive://bill/backup/a.iso",
+            "./a.iso",
+            "--conflict",
+            "operation-suffix",
+        ])
+        .unwrap();
+        let Command::Get(args) = cli.command else {
+            panic!("expected get");
+        };
+        assert_eq!(args.source, "gdrive://bill/backup/a.iso");
+        assert_eq!(args.dest, PathBuf::from("./a.iso"));
+        assert_eq!(args.conflict, Conflict::OperationSuffix);
+        assert_eq!(args.root, None);
+    }
+
+    #[test]
+    fn list_takes_a_directory_uri() {
+        let cli = Cli::try_parse_from(["wb", "list", "gdrive://bill/backup/"]).unwrap();
+        let Command::List(args) = cli.command else {
+            panic!("expected list");
+        };
+        assert_eq!(args.uri, "gdrive://bill/backup/");
     }
 }

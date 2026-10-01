@@ -217,9 +217,170 @@ fn derive_operation(instance: &str, target: &str, digest: &str) -> String {
     format!("wb-{}", &blake3::hash(&input).to_hex()[..16])
 }
 
+/// 单个待取回文件：解析后的云对象与本地目标。
+pub(crate) struct DownloadJob {
+    /// 云对象引用（Drive 文件 ID）。
+    pub reference: String,
+    /// 远端文件名，用于展示与目录展开。
+    pub name: String,
+    /// 本地目标文件路径。
+    pub target: String,
+}
+
+/// 下载编排资源；事件复用上传队列的形态。
+pub(crate) struct DownloadRunner {
+    pub source: std::sync::Arc<dyn waybill::download::DownloadSource>,
+    pub target: std::sync::Arc<dyn waybill::download::DownloadTarget>,
+    pub store: FileCheckpointStore,
+    pub engine: waybill::download::DownloadEngine,
+    pub stop: StopToken,
+    pub conflict: ConflictPolicy,
+    pub events: mpsc::Sender<Event>,
+}
+
+impl DownloadRunner {
+    /// 取回单个文件；进度语义为「已读取 / 已持久化区间 / 总长」。
+    pub(crate) async fn run(self, job: DownloadJob, operation_override: Option<String>) -> Outcome {
+        let mut receipts = 0;
+        let mut failures = 0;
+        match self.deliver(&job, operation_override.as_deref()).await {
+            Ok(()) => receipts += 1,
+            Err(Failure { message, kind }) => {
+                let _ = self
+                    .events
+                    .send(Event::Failed {
+                        index: 0,
+                        name: job.name.clone(),
+                        message,
+                        paused: kind == ErrorKind::Paused,
+                    })
+                    .await;
+                failures += 1;
+            }
+        }
+        let stopped = self.stop.is_stopped();
+        let _ = self
+            .events
+            .send(Event::Done {
+                receipts,
+                failures,
+                stopped,
+            })
+            .await;
+        Outcome { failures, stopped }
+    }
+
+    async fn deliver(
+        &self,
+        job: &DownloadJob,
+        operation_override: Option<&str>,
+    ) -> Result<(), Failure> {
+        let identity = self.source.identity().await.map_err(|e| failure(&e))?;
+        let operation = operation_override.map(str::to_string).unwrap_or_else(|| {
+            derive_download_operation(
+                &self.target.identity().instance,
+                &job.reference,
+                &identity.revision,
+                &job.target,
+            )
+        });
+        self.events
+            .send(Event::Started {
+                index: 0,
+                name: job.name.clone(),
+                target: job.target.clone(),
+                size: identity.size,
+                operation: operation.clone(),
+            })
+            .await
+            .map_err(|_| output_closed())?;
+        let receipt = self
+            .engine
+            .run(
+                self.source.as_ref(),
+                self.target.as_ref(),
+                &self.store,
+                waybill::download::DownloadOptions {
+                    intent: waybill::download::DownloadIntent {
+                        operation,
+                        target: job.target.clone(),
+                        conflict: self.conflict,
+                    },
+                    stop: &self.stop,
+                    progress: &|p| {
+                        // 同步回调不能等待；进度可合并，生命周期事件则必须交付。
+                        if let Err(mpsc::error::TrySendError::Closed(_)) =
+                            self.events.try_send(Event::Progress {
+                                index: 0,
+                                persisted: p.persisted,
+                                sent: p.read,
+                                total: p.total,
+                                epoch: 0,
+                                complete: p.complete,
+                            })
+                        {
+                            self.stop.stop();
+                        }
+                    },
+                },
+            )
+            .await
+            .map_err(|e| failure(&e))?;
+        self.events
+            .send(Event::Completed { index: 0, receipt })
+            .await
+            .map_err(|_| output_closed())?;
+        Ok(())
+    }
+}
+
+/// 下载默认操作 ID：实例、云对象引用、源版本与本地目标联合派生。
+///
+/// 远端更新即新运单；同版本重跑得到同一操作（续传或回执幂等）。
+fn derive_download_operation(
+    instance: &str,
+    reference: &str,
+    revision: &str,
+    target: &str,
+) -> String {
+    let mut input =
+        Vec::with_capacity(instance.len() + reference.len() + revision.len() + target.len() + 3);
+    input.extend_from_slice(instance.as_bytes());
+    input.push(0);
+    input.extend_from_slice(reference.as_bytes());
+    input.push(0);
+    input.extend_from_slice(revision.as_bytes());
+    input.push(0);
+    input.extend_from_slice(target.as_bytes());
+    format!("wb-{}", &blake3::hash(&input).to_hex()[..16])
+}
+
 #[cfg(test)]
 mod tests {
     use super::derive_operation;
+
+    #[test]
+    fn download_operation_binds_source_version_and_target() {
+        use super::derive_download_operation;
+        let a = derive_download_operation("instance", "file-1", "3:abc:16", "/tmp/a.iso");
+        assert_eq!(
+            a,
+            derive_download_operation("instance", "file-1", "3:abc:16", "/tmp/a.iso")
+        );
+        assert_ne!(
+            a,
+            derive_download_operation("instance", "file-1", "4:abd:16", "/tmp/a.iso")
+        );
+        assert_ne!(
+            a,
+            derive_download_operation("instance", "file-2", "3:abc:16", "/tmp/a.iso")
+        );
+        assert_ne!(
+            a,
+            derive_download_operation("instance", "file-1", "3:abc:16", "/tmp/b.iso")
+        );
+        assert!(a.starts_with("wb-") && a.len() == 19);
+    }
 
     #[test]
     fn operation_is_stable_and_bound_to_identity() {

@@ -88,7 +88,7 @@ pub(crate) async fn run(
                 clear_progress(&mut stderr, progress_tty && last.is_some());
                 let marker = if paused { "⏸" } else { "✗" };
                 let hint = if paused {
-                    "（重跑同一命令继续上传）"
+                    "（重跑同一命令继续传输）"
                 } else {
                     ""
                 };
