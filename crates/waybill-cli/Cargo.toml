@@ -3,9 +3,7 @@ name = "waybill-cli"
 description = "运单命令行工具：可恢复的云端投递"
 version.workspace = true
 edition.workspace = true
-# 宿主工具的 MSRV 高于库：ratatui-kit 0.10 精确锁定 ratatui 0.30.2，
-# 其模块化 crate 族声明 rustc 1.88。库与 service 仍承诺 1.85。
-rust-version = "1.88"
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

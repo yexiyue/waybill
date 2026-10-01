@@ -195,18 +195,19 @@ async fn authorize(
                 .next()
                 .and_then(|l| l.strip_prefix("GET "))
                 .and_then(|l| l.split_whitespace().next());
-            if let Some(target) = target {
-                if let Ok(callback) = url::Url::parse(&format!("http://127.0.0.1:{port}{target}")) {
+            if let Some(code) = target
+                .and_then(|target| {
+                    url::Url::parse(&format!("http://127.0.0.1:{port}{target}")).ok()
+                })
+                .filter(|callback| callback.path() == "/oauth/callback")
+                .and_then(|callback| {
                     let pairs: std::collections::HashMap<_, _> =
                         callback.query_pairs().into_owned().collect();
-                    if callback.path() == "/oauth/callback"
-                        && pairs.get("state").is_some_and(|s| s == state.secret())
-                    {
-                        if let Some(code) = pairs.get("code") {
-                            return Ok::<_, std::io::Error>((code.clone(), socket));
-                        }
-                    }
-                }
+                    let state_ok = pairs.get("state").is_some_and(|s| s == state.secret());
+                    state_ok.then(|| pairs.get("code").cloned()).flatten()
+                })
+            {
+                return Ok::<_, std::io::Error>((code, socket));
             }
             let _ = socket
                 .write_all(

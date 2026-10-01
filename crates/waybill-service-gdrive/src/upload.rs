@@ -146,7 +146,7 @@ impl UploadSink for Gdrive {
             if data.is_empty()
                 || data.len() > 8 * 1024 * 1024
                 || end > source.size
-                || (end != source.size && data.len() % (256 * 1024) != 0)
+                || (end != source.size && !data.len().is_multiple_of(256 * 1024))
             {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
