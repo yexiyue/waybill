@@ -125,4 +125,5 @@ Tokio 文件 IO 内部复制缓冲限制为 256 KiB；该收紧经两平台测�
 - 补充双路上传、长时运行与更多网络 / 文件系统环境的资源样本。
 - SwarmDrop 正式回接另立 OpenSpec；本期仅同步 D3 的 staged_complete 设计及孵化记录。
 - 下载及本地最终发布进入 M2；WebDAV、OSS 和按需 OpenDAL 后移。
-- 保留两仓原有未提交改动；没有 commit、push、发布或稳定 API 声明。
+- waybill 本轮改动已按用户授权提交；未推送、未发布或声明稳定 API。
+  SwarmDrop 侧原有未提交改动保持原状。

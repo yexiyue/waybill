@@ -13,10 +13,11 @@
 
 ## 当前仓库
 
-项目处于 **M1 GDrive 上传恢复原型阶段，未发布**。核心已提供公开上传契约，
-service-fs 提供稳定源和 checkpoint，service-gdrive 提供上传与对账；`wb` CLI
-完成 login / put / status 的上传侧闭环（真机验收待补）。下载与本地发布
-后续实现；Operator / registry 等长期设计草图不是既有 API。
+项目处于 **M2 GDrive 下载与本地发布启动阶段，未发布**。M1 已交付公开上传
+契约、service-fs 稳定源与 checkpoint、service-gdrive 上传与对账，`wb` CLI
+的 login / put / status 上传侧闭环已通过真机验收（见
+[docs/VALIDATION.zh-CN.md](docs/VALIDATION.zh-CN.md)）。下载与本地发布是
+当前工作；Operator / registry 等长期设计草图不是既有 API。
 
 | 路径 | 用途 |
 |---|---|
