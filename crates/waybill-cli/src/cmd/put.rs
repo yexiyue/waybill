@@ -1,16 +1,16 @@
 //! `wb put`：多文件顺序投递；重跑同一命令即续传或回执幂等跳过。
 use crate::{
     cli::PutArgs,
+    cmd::session,
     error::CliError,
     gdrive_host,
     paths::Layout,
-    transfer::{self, Job},
-    ui, uri,
+    transfer::{UploadJob, UploadRunner},
+    uri,
 };
-use std::{collections::HashSet, io::IsTerminal, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 use waybill::{
     budget::ResourceBudget,
-    error::{Error, ErrorKind},
     service::Service,
     upload::{StopToken, UploadEngine, UploadIntent},
 };
@@ -64,7 +64,7 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
         if !seen.insert(target.clone()) {
             return Err(CliError::Message(format!("多个源映射到同一目标：{target}")));
         }
-        jobs.push(Job { path, name, target });
+        jobs.push(UploadJob { path, name, target });
     }
     let root = root.as_deref().unwrap_or("root");
     let layout = Layout::discover()?;
@@ -74,13 +74,12 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
     let engine = UploadEngine::new(Arc::new(ResourceBudget::default()));
     let stop = StopToken::default();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let total_files = jobs.len();
     let queued_files = jobs
         .iter()
         .map(|job| (job.name.clone(), job.target.clone()))
         .collect();
     let handle = tokio::spawn(
-        transfer::Runner {
+        UploadRunner {
             sink,
             store,
             engine,
@@ -90,18 +89,11 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
         }
         .run(jobs, operation),
     );
-    let abort = handle.abort_handle();
-
-    let interactive =
-        !json && !no_tui && std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
-    let rendered = if json {
-        install_ctrl_c(stop.clone(), abort.clone());
-        ui::json::run(rx).await
-    } else if interactive {
-        // 面板接管按键与 Ctrl-C；非 TTY 或 --no-tui 走行式输出。
-        ui::tui::run(ui::tui::Handoff {
-            receiver: rx,
-            stop: stop.clone(),
+    session::run(
+        handle,
+        rx,
+        stop,
+        session::Settings {
             banner: format!(
                 "gdrive · {} · {}",
                 dest.account,
@@ -112,57 +104,12 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
                 }
             ),
             queued_files,
-        })
-        .await
-        .map(|forced| {
-            if forced {
-                abort.abort();
-            }
-        })
-    } else {
-        // 行式模式由 Ctrl-C 触发优雅停止。
-        install_ctrl_c(stop.clone(), abort.clone());
-        ui::plain::run(rx, total_files, verbose > 0).await
-    };
-    if rendered.is_err() {
-        // 输出通道断裂：先请求停止再收割任务，避免孤儿传输。
-        stop.stop();
-    }
-    let outcome = match handle.await {
-        Ok(outcome) => outcome,
-        Err(error) if error.is_cancelled() => return Err(paused()),
-        Err(_) => return Err(CliError::Message("传输任务异常退出".into())),
-    };
-    rendered?;
-    if outcome.stopped {
-        return Err(paused());
-    }
-    if outcome.failures > 0 {
-        return Err(CliError::Message(format!(
-            "{} 个文件投递失败；重跑同一命令可续传或幂等跳过",
-            outcome.failures
-        )));
-    }
-    Ok(())
-}
-
-/// 首次 Ctrl-C 优雅停止；再次按下中止任务并保留最近持久记录。
-pub(crate) fn install_ctrl_c(stop: StopToken, abort: tokio::task::AbortHandle) {
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            stop.stop();
-            if tokio::signal::ctrl_c().await.is_ok() {
-                abort.abort();
-            }
-        }
-    });
-}
-
-pub(crate) fn paused() -> CliError {
-    CliError::Waybill(Error::new(
-        ErrorKind::Paused,
-        "stopped; rerun the same command to resume",
-    ))
+            json,
+            verbose: verbose > 0,
+            no_tui,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -170,6 +117,7 @@ mod tests {
     use super::*;
     use crate::cli::Conflict;
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    use waybill::error::ErrorKind;
 
     fn args(sources: Vec<std::path::PathBuf>, dest: &str) -> PutArgs {
         PutArgs {

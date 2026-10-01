@@ -36,7 +36,7 @@ pub struct UploadIntent {
 impl UploadIntent {
     /// 校验有界操作标识和目标路径。
     pub fn validate(&self) -> Result<()> {
-        if !valid_operation(&self.operation) || !valid_target(&self.target) {
+        if !valid_operation(&self.operation) || !crate::object::valid_object_path(&self.target) {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid upload intent"));
         }
         Ok(())
@@ -49,18 +49,6 @@ pub(crate) fn valid_operation(operation: &str) -> bool {
         && operation
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
-}
-/// 目标路径：段非空且不含 `.`、`..`、反斜杠或控制字符。
-fn valid_target(target: &str) -> bool {
-    !target.is_empty()
-        && target.len() <= 4096
-        && target.split('/').all(|segment| {
-            !segment.is_empty()
-                && segment != "."
-                && segment != ".."
-                && segment.len() <= 255
-                && !segment.chars().any(|c| c.is_control() || c == '\\')
-        })
 }
 /// BLAKE3 小写十六进制摘要（64 字符）。
 fn valid_digest(value: &str) -> bool {

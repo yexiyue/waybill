@@ -43,7 +43,7 @@ pub async fn run(
     } else {
         println!("已登录 gdrive：{account}");
         println!("凭证保存在本机私有目录：{}", dir.display());
-        println!("开始投递：wb put <文件> gdrive://{account}/<目录>/");
+        println!("开始上传：wb put <文件>；浏览云盘：wb list（终端内交互选择）");
     }
     Ok(())
 }

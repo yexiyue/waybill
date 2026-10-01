@@ -5,6 +5,7 @@
 mod cli;
 mod cmd;
 mod credentials;
+mod drives;
 mod error;
 mod gdrive_host;
 mod oauth;

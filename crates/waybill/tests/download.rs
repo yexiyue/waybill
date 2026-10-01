@@ -36,6 +36,7 @@ fn log(events: &Events, entry: String) {
 
 /// 可注入延迟、失败与版本变化的云端源替身。
 struct FakeSource {
+    instance: String,
     data: Vec<u8>,
     revision: Mutex<String>,
     digest: Option<Digest>,
@@ -48,6 +49,7 @@ struct FakeSource {
 impl FakeSource {
     fn new(size: usize) -> Self {
         Self {
+            instance: "source-account".into(),
             data: (0..size).map(|byte| (byte % 251) as u8).collect(),
             revision: Mutex::new("rev-1".into()),
             digest: Some(Digest {
@@ -63,6 +65,10 @@ impl FakeSource {
     }
     fn identity_value(&self) -> RemoteIdentity {
         RemoteIdentity {
+            service: ServiceIdentity {
+                service: ServiceId::parse("test:remote").unwrap(),
+                instance: self.instance.clone(),
+            },
             reference: "fake-object".into(),
             revision: self.revision.lock().unwrap().clone(),
             size: self.data.len() as u64,
@@ -755,18 +761,48 @@ async fn publish_window_reconciles_the_destination() {
     let source = FakeSource::new(16);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
+    let progress = Mutex::new(Vec::new());
     store.fail_save_with_receipt.store(true, Ordering::Release);
     let result = engine(8, 1)
         .run(
             &source,
             &target,
             &store,
-            options(intent("op-1"), &StopToken::default(), &|_| {}),
+            options(intent("op-1"), &StopToken::default(), &|update| {
+                progress.lock().unwrap().push(update);
+            }),
         )
         .await;
     assert!(
         matches!(result, Err(e) if e.kind == ErrorKind::Checkpoint),
         "发布成功但回执落盘失败"
+    );
+    assert!(
+        progress
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|update| !update.complete),
+        "回执持久化失败不得报告完成"
+    );
+    // 完成对账分支同样必须先持久化回执，再发送完成进度。
+    let failed_reconciliation = engine(8, 1)
+        .run(
+            &source,
+            &target,
+            &store,
+            options(intent("op-1"), &StopToken::default(), &|update| {
+                progress.lock().unwrap().push(update);
+            }),
+        )
+        .await;
+    assert!(matches!(failed_reconciliation, Err(error) if error.kind == ErrorKind::Checkpoint));
+    assert!(
+        progress
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|update| !update.complete)
     );
     // 重跑对账目标位置：零读取返回原回执。
     store.fail_save_with_receipt.store(false, Ordering::Release);
@@ -776,11 +812,22 @@ async fn publish_window_reconciles_the_destination() {
             &source,
             &target,
             &store,
-            options(intent("op-1"), &StopToken::default(), &|_| {}),
+            options(intent("op-1"), &StopToken::default(), &|update| {
+                progress.lock().unwrap().push(update);
+            }),
         )
         .await
         .unwrap();
     assert_eq!(receipt.size, 16);
+    assert_eq!(
+        progress
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|update| update.complete)
+            .count(),
+        1
+    );
     assert_eq!(source.reads.lock().unwrap().len(), reads_before);
     engine(8, 1).confirm(&store, &receipt).await.unwrap();
     assert!(!store.contains("op-1"));
@@ -983,6 +1030,10 @@ fn v2_records_roundtrip_and_download_records_stay_distinct() {
             instance: "local".into(),
         },
         source: RemoteIdentity {
+            service: ServiceIdentity {
+                service: ServiceId::parse("test:remote").unwrap(),
+                instance: "source-account".into(),
+            },
             reference: "file-1".into(),
             revision: "1:abc:4".into(),
             size: 4,
@@ -1002,4 +1053,119 @@ fn v2_records_roundtrip_and_download_records_stay_distinct() {
     let download_json = serde_json::to_string(&download).unwrap();
     let parsed: Checkpoint = serde_json::from_str(&download_json).unwrap();
     assert!(parsed.download().is_some());
+}
+
+#[tokio::test]
+async fn matching_object_from_a_different_source_instance_cannot_resume() {
+    let events = events();
+    let source = FakeSource::new(16);
+    let target = FakeTarget::new(&events);
+    let store = SharedStore::new(&events);
+    engine(8, 1)
+        .run(
+            &source,
+            &target,
+            &store,
+            options(intent("namespace-bound"), &StopToken::default(), &|_| {}),
+        )
+        .await
+        .unwrap();
+    let mut other = FakeSource::new(16);
+    other.instance = "different-account".into();
+    // 除实例外，对象引用、版本、长度与摘要均完全一致。
+    let mut original_identity = source.identity_value();
+    original_identity.service.instance = other.instance.clone();
+    assert_eq!(original_identity, other.identity_value());
+    let result = engine(8, 1)
+        .run(
+            &other,
+            &target,
+            &store,
+            options(intent("namespace-bound"), &StopToken::default(), &|_| {}),
+        )
+        .await;
+    assert!(matches!(result, Err(error) if error.kind == ErrorKind::IdentityMismatch));
+    assert!(other.reads.lock().unwrap().is_empty());
+    assert!(store.contains("namespace-bound"));
+}
+
+#[tokio::test]
+async fn malformed_saved_ledgers_are_rejected_before_reads_or_writes() {
+    for (label, persisted) in [
+        (
+            "overlap",
+            vec![
+                Interval { start: 0, end: 8 },
+                Interval { start: 4, end: 12 },
+            ],
+        ),
+        (
+            "unsorted",
+            vec![
+                Interval { start: 8, end: 12 },
+                Interval { start: 0, end: 4 },
+            ],
+        ),
+        ("beyond-source", vec![Interval { start: 8, end: 17 }]),
+        (
+            "overflow",
+            vec![
+                Interval {
+                    start: 0,
+                    end: u64::MAX,
+                },
+                Interval {
+                    start: 1,
+                    end: u64::MAX,
+                },
+            ],
+        ),
+        (
+            "reversed",
+            vec![Interval {
+                start: u64::MAX,
+                end: 0,
+            }],
+        ),
+        ("empty", vec![Interval { start: 8, end: 8 }]),
+    ] {
+        let events = events();
+        let source = FakeSource::new(16);
+        let target = FakeTarget::new(&events);
+        let store = SharedStore::new(&events);
+        store.seed(
+            DownloadFlow {
+                intent: intent(label),
+                service: target.identity(),
+                source: source.identity_value(),
+                persisted,
+                driver: encode_state(&FakeTargetState {
+                    initialized: true,
+                    verified: false,
+                }),
+                receipt: None,
+            }
+            .checkpoint(),
+        );
+        let saved = store.records.lock().unwrap().get(label).unwrap().clone();
+        let result = engine(8, 2)
+            .run(
+                &source,
+                &target,
+                &store,
+                options(intent(label), &StopToken::default(), &|_| {}),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(error) if error.kind == ErrorKind::Checkpoint),
+            "{label}"
+        );
+        assert!(source.reads.lock().unwrap().is_empty(), "{label}");
+        assert!(events.lock().unwrap().is_empty(), "{label}");
+        assert_eq!(
+            store.records.lock().unwrap().get(label).unwrap().download(),
+            saved.download(),
+            "{label}"
+        );
+    }
 }

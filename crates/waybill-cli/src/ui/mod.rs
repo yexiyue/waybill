@@ -1,5 +1,6 @@
 //! 事件流的输出形态与共享渲染工具。
 pub(crate) mod json;
+pub(crate) mod picker;
 pub(crate) mod plain;
 pub(crate) mod tui;
 

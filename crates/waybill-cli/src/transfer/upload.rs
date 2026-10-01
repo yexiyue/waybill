@@ -1,67 +1,24 @@
-//! 多文件顺序投递编排：只产出事件，不感知终端形态。
-//!
-//! CLI 保留已完成 checkpoint 作为持久运单：重跑同一命令仍使用原对象 ID
-//! 对账回执，不会丢失幂等身份后新建或误报同名冲突。
+//! 上传队列编排；不感知终端形态。
+use super::{
+    Event, Failure, Outcome, complete_queue, emit_progress, failure, operation_id, output_closed,
+};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use waybill::{
     error::ErrorKind,
     source::Source,
-    upload::{ConflictPolicy, Receipt, RunOptions, StopToken, UploadEngine, UploadIntent},
+    upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent},
 };
 use waybill_service_fs::{FileCheckpointStore, FileSource};
-
-/// 发往输出 sink 的事件流；字段只含可展示数据。
-pub(crate) enum Event {
-    /// 单个文件开始投递。
-    Started {
-        index: usize,
-        name: String,
-        target: String,
-        size: u64,
-        operation: String,
-    },
-    /// 引擎进度；persisted 为服务端确认并已落盘的字节数。
-    Progress {
-        index: usize,
-        persisted: u64,
-        sent: u64,
-        total: u64,
-        epoch: u32,
-        complete: bool,
-    },
-    /// 单个文件取得回执。
-    Completed { index: usize, receipt: Receipt },
-    /// 单个文件失败；message 为库错误的受控 Display。
-    Failed {
-        index: usize,
-        name: String,
-        message: String,
-        paused: bool,
-    },
-    /// 全部队列结束。
-    Done {
-        receipts: usize,
-        failures: usize,
-        stopped: bool,
-    },
-}
-
 /// 一个待投递文件：本地路径与解析后的远端目标。
-pub(crate) struct Job {
+pub(crate) struct UploadJob {
     pub path: PathBuf,
     pub name: String,
     pub target: String,
 }
 
-/// 队列的最终结果；成功计数经 Done 事件交付，此处只保留退出判定所需。
-pub(crate) struct Outcome {
-    pub failures: usize,
-    pub stopped: bool,
-}
-
 /// 编排资源由一个队列拥有，输出通过有界通道交付。
-pub(crate) struct Runner {
+pub(crate) struct UploadRunner {
     pub sink: std::sync::Arc<dyn waybill::upload::UploadSink>,
     pub store: FileCheckpointStore,
     pub engine: UploadEngine,
@@ -70,9 +27,13 @@ pub(crate) struct Runner {
     pub events: mpsc::Sender<Event>,
 }
 
-impl Runner {
+impl UploadRunner {
     /// 顺序投递全部任务；事件发完（含 Done）后返回。
-    pub(crate) async fn run(self, jobs: Vec<Job>, operation_override: Option<String>) -> Outcome {
+    pub(crate) async fn run(
+        self,
+        jobs: Vec<UploadJob>,
+        operation_override: Option<String>,
+    ) -> Outcome {
         let mut receipts = 0;
         let mut failures = 0;
         let mut stopped = false;
@@ -86,16 +47,9 @@ impl Runner {
                 .await
             {
                 Ok(()) => receipts += 1,
-                Err(Failure { message, kind }) => {
-                    let _ = self
-                        .events
-                        .send(Event::Failed {
-                            index,
-                            name: job.name.clone(),
-                            message,
-                            paused: kind == ErrorKind::Paused,
-                        })
-                        .await;
+                Err(error) => {
+                    let kind = error.kind;
+                    error.emit(&self.events, index, job.name.clone()).await;
                     failures += 1;
                     if kind == ErrorKind::Paused {
                         stopped = true;
@@ -108,31 +62,19 @@ impl Runner {
                 }
             }
         }
-        let _ = self
-            .events
-            .send(Event::Done {
-                receipts,
-                failures,
-                stopped,
-            })
-            .await;
-        Outcome { failures, stopped }
+        complete_queue(&self.events, receipts, failures, stopped).await
     }
 
     async fn deliver(
         &self,
         index: usize,
-        job: &Job,
+        job: &UploadJob,
         operation_override: Option<&str>,
     ) -> Result<(), Failure> {
         let source = FileSource::open(&job.path).await.map_err(|e| failure(&e))?;
         let identity = source.identity().await.map_err(|e| failure(&e))?;
         let operation = operation_override.map(str::to_string).unwrap_or_else(|| {
-            derive_operation(
-                &self.sink.identity().instance,
-                &job.target,
-                &identity.blake3,
-            )
+            derive_operation(&self.sink.identity(), &job.target, &identity.blake3)
         });
         self.events
             .send(Event::Started {
@@ -159,19 +101,18 @@ impl Runner {
                     policy: Default::default(),
                     stop: &self.stop,
                     progress: &|p| {
-                        // 同步回调不能等待；进度可合并，生命周期事件则必须交付。
-                        if let Err(mpsc::error::TrySendError::Closed(_)) =
-                            self.events.try_send(Event::Progress {
+                        emit_progress(
+                            &self.events,
+                            &self.stop,
+                            Event::Progress {
                                 index,
                                 persisted: p.persisted,
                                 sent: p.sent,
                                 total: p.total,
                                 epoch: p.epoch,
                                 complete: p.complete,
-                            })
-                        {
-                            self.stop.stop();
-                        }
+                            },
+                        );
                     },
                 },
             )
@@ -185,222 +126,51 @@ impl Runner {
     }
 }
 
-fn output_closed() -> Failure {
-    Failure {
-        message: "output closed; rerun the same command to resume".into(),
-        kind: ErrorKind::Paused,
-    }
-}
-
-struct Failure {
-    message: String,
-    kind: ErrorKind,
-}
-
-fn failure(error: &waybill::error::Error) -> Failure {
-    Failure {
-        message: error.to_string(),
-        kind: error.kind,
-    }
-}
-
 /// 默认操作 ID：实例、目标与内容摘要联合派生。
 ///
 /// 同一命令重跑得到同一操作（续传或回执幂等）；文件改动即新运单。
-fn derive_operation(instance: &str, target: &str, digest: &str) -> String {
-    let mut input = Vec::with_capacity(instance.len() + target.len() + digest.len() + 2);
-    input.extend_from_slice(instance.as_bytes());
-    input.push(0);
-    input.extend_from_slice(target.as_bytes());
-    input.push(0);
-    input.extend_from_slice(digest.as_bytes());
-    format!("wb-{}", &blake3::hash(&input).to_hex()[..16])
-}
-
-/// 单个待取回文件：解析后的云对象与本地目标。
-pub(crate) struct DownloadJob {
-    /// 云对象引用（Drive 文件 ID）。
-    pub reference: String,
-    /// 远端文件名，用于展示与目录展开。
-    pub name: String,
-    /// 本地目标文件路径。
-    pub target: String,
-}
-
-/// 下载编排资源；事件复用上传队列的形态。
-pub(crate) struct DownloadRunner {
-    pub source: std::sync::Arc<dyn waybill::download::DownloadSource>,
-    pub target: std::sync::Arc<dyn waybill::download::DownloadTarget>,
-    pub store: FileCheckpointStore,
-    pub engine: waybill::download::DownloadEngine,
-    pub stop: StopToken,
-    pub conflict: ConflictPolicy,
-    pub events: mpsc::Sender<Event>,
-}
-
-impl DownloadRunner {
-    /// 取回单个文件；进度语义为「已读取 / 已持久化区间 / 总长」。
-    pub(crate) async fn run(self, job: DownloadJob, operation_override: Option<String>) -> Outcome {
-        let mut receipts = 0;
-        let mut failures = 0;
-        match self.deliver(&job, operation_override.as_deref()).await {
-            Ok(()) => receipts += 1,
-            Err(Failure { message, kind }) => {
-                let _ = self
-                    .events
-                    .send(Event::Failed {
-                        index: 0,
-                        name: job.name.clone(),
-                        message,
-                        paused: kind == ErrorKind::Paused,
-                    })
-                    .await;
-                failures += 1;
-            }
-        }
-        let stopped = self.stop.is_stopped();
-        let _ = self
-            .events
-            .send(Event::Done {
-                receipts,
-                failures,
-                stopped,
-            })
-            .await;
-        Outcome { failures, stopped }
-    }
-
-    async fn deliver(
-        &self,
-        job: &DownloadJob,
-        operation_override: Option<&str>,
-    ) -> Result<(), Failure> {
-        let identity = self.source.identity().await.map_err(|e| failure(&e))?;
-        let operation = operation_override.map(str::to_string).unwrap_or_else(|| {
-            derive_download_operation(
-                &self.target.identity().instance,
-                &job.reference,
-                &identity.revision,
-                &job.target,
-            )
-        });
-        self.events
-            .send(Event::Started {
-                index: 0,
-                name: job.name.clone(),
-                target: job.target.clone(),
-                size: identity.size,
-                operation: operation.clone(),
-            })
-            .await
-            .map_err(|_| output_closed())?;
-        let receipt = self
-            .engine
-            .run(
-                self.source.as_ref(),
-                self.target.as_ref(),
-                &self.store,
-                waybill::download::DownloadOptions {
-                    intent: waybill::download::DownloadIntent {
-                        operation,
-                        target: job.target.clone(),
-                        conflict: self.conflict,
-                    },
-                    stop: &self.stop,
-                    progress: &|p| {
-                        // 同步回调不能等待；进度可合并，生命周期事件则必须交付。
-                        if let Err(mpsc::error::TrySendError::Closed(_)) =
-                            self.events.try_send(Event::Progress {
-                                index: 0,
-                                persisted: p.persisted,
-                                sent: p.read,
-                                total: p.total,
-                                epoch: 0,
-                                complete: p.complete,
-                            })
-                        {
-                            self.stop.stop();
-                        }
-                    },
-                },
-            )
-            .await
-            .map_err(|e| failure(&e))?;
-        self.events
-            .send(Event::Completed { index: 0, receipt })
-            .await
-            .map_err(|_| output_closed())?;
-        Ok(())
-    }
-}
-
-/// 下载默认操作 ID：实例、云对象引用、源版本与本地目标联合派生。
-///
-/// 远端更新即新运单；同版本重跑得到同一操作（续传或回执幂等）。
-fn derive_download_operation(
-    instance: &str,
-    reference: &str,
-    revision: &str,
+fn derive_operation(
+    service: &waybill::service::ServiceIdentity,
     target: &str,
+    digest: &str,
 ) -> String {
-    let mut input =
-        Vec::with_capacity(instance.len() + reference.len() + revision.len() + target.len() + 3);
-    input.extend_from_slice(instance.as_bytes());
-    input.push(0);
-    input.extend_from_slice(reference.as_bytes());
-    input.push(0);
-    input.extend_from_slice(revision.as_bytes());
-    input.push(0);
-    input.extend_from_slice(target.as_bytes());
-    format!("wb-{}", &blake3::hash(&input).to_hex()[..16])
+    operation_id(&[
+        "upload",
+        service.service.as_str(),
+        &service.instance,
+        target,
+        digest,
+    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::derive_operation;
-
-    #[test]
-    fn download_operation_binds_source_version_and_target() {
-        use super::derive_download_operation;
-        let a = derive_download_operation("instance", "file-1", "3:abc:16", "/tmp/a.iso");
-        assert_eq!(
-            a,
-            derive_download_operation("instance", "file-1", "3:abc:16", "/tmp/a.iso")
-        );
-        assert_ne!(
-            a,
-            derive_download_operation("instance", "file-1", "4:abd:16", "/tmp/a.iso")
-        );
-        assert_ne!(
-            a,
-            derive_download_operation("instance", "file-2", "3:abc:16", "/tmp/a.iso")
-        );
-        assert_ne!(
-            a,
-            derive_download_operation("instance", "file-1", "3:abc:16", "/tmp/b.iso")
-        );
-        assert!(a.starts_with("wb-") && a.len() == 19);
+    fn service(instance: &str) -> waybill::service::ServiceIdentity {
+        waybill::service::ServiceIdentity {
+            service: waybill::service::ServiceId::parse("test:drive").unwrap(),
+            instance: instance.into(),
+        }
     }
 
     #[test]
     fn operation_is_stable_and_bound_to_identity() {
-        let a = derive_operation("instance", "backup/a.iso", &"0".repeat(64));
+        let instance = service("instance");
+        let other = service("other");
+        let a = derive_operation(&instance, "backup/a.iso", &"0".repeat(64));
         assert_eq!(
             a,
-            derive_operation("instance", "backup/a.iso", &"0".repeat(64))
+            derive_operation(&instance, "backup/a.iso", &"0".repeat(64))
         );
         assert_ne!(
             a,
-            derive_operation("instance", "backup/b.iso", &"0".repeat(64))
+            derive_operation(&instance, "backup/b.iso", &"0".repeat(64))
         );
-        assert_ne!(
-            a,
-            derive_operation("other", "backup/a.iso", &"0".repeat(64))
-        );
+        assert_ne!(a, derive_operation(&other, "backup/a.iso", &"0".repeat(64)));
         assert!(a.starts_with("wb-") && a.len() == 19);
     }
 
-    use super::{Event, Job, Runner};
+    use super::{Event, UploadJob, UploadRunner};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -501,7 +271,7 @@ mod tests {
         stop: StopToken,
     ) -> (super::Outcome, Vec<Event>) {
         let (events, mut receiver) = tokio::sync::mpsc::channel(64);
-        let runner = Runner {
+        let runner = UploadRunner {
             sink,
             store: FileCheckpointStore::new(dir.join("checkpoints")),
             engine: UploadEngine::new(Arc::new(ResourceBudget::default())),
@@ -511,7 +281,7 @@ mod tests {
         };
         let outcome = runner
             .run(
-                vec![Job {
+                vec![UploadJob {
                     path: dir.join("source"),
                     name: "source".into(),
                     target: "target".into(),

@@ -26,24 +26,10 @@ pub async fn run(args: ListArgs, json: bool) -> Result<(), CliError> {
     let layout = Layout::discover()?;
     let root = root.as_deref().unwrap_or("root");
     let drive = gdrive_host::build(&layout, &parsed.account, root).await?;
-    let resolved = drive.resolve("/").await.map_err(CliError::from)?;
-    let Resolved::Folder { id: root_id } = resolved else {
-        return Err(CliError::Message("根目录解析异常".into()));
-    };
-    // 目录前缀逐段解析；空前缀即根目录本身。
-    let folder = if parsed.target.is_empty() {
-        root_id
-    } else {
-        match drive.resolve(&format!("{}/", parsed.target)).await {
-            Ok(Resolved::Folder { id }) => id,
-            Ok(Resolved::File(_)) => {
-                return Err(CliError::Message(format!(
-                    "云端路径 {} 不是目录",
-                    parsed.target
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        }
+    let path = format!("{}/", parsed.target);
+    let folder = match drive.resolve(&path).await? {
+        Resolved::Folder { id } => id,
+        Resolved::File(_) => return Err(CliError::Message("云端路径不是目录".into())),
     };
     let entries = drive.list(&folder).await.map_err(CliError::from)?;
     let mut rows: Vec<EntryRow> = entries
@@ -56,11 +42,7 @@ pub async fn run(args: ListArgs, json: bool) -> Result<(), CliError> {
             modified: file.modified_time,
         })
         .collect();
-    rows.sort_by(|a, b| {
-        b.folder
-            .cmp(&a.folder)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    rows.sort_by_cached_key(|row| (!row.folder, row.name.to_lowercase(), row.id.clone()));
     if json {
         println!("{}", serde_json::to_string(&rows)?);
     } else {

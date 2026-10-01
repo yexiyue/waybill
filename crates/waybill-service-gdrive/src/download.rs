@@ -12,7 +12,7 @@ use waybill::{
     BoxFuture,
     download::{Digest, DigestAlgorithm, DownloadSource, RemoteIdentity},
     error::{Error, ErrorKind, Result},
-    service::Capabilities,
+    service::{Capabilities, ServiceIdentity},
 };
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const MEDIA_CHUNK_LIMIT: usize = 8 * 1024 * 1024;
@@ -58,6 +58,7 @@ pub enum Resolved {
 }
 /// 绑定单个 Drive 文件的下载源。
 pub struct GdriveMedia {
+    service: ServiceIdentity,
     api: Arc<crate::client::DriveClient>,
     reference: String,
 }
@@ -103,6 +104,7 @@ impl DownloadSource for GdriveMedia {
                 size
             );
             Ok(RemoteIdentity {
+                service: self.service.clone(),
                 reference: file.id,
                 revision,
                 size,
@@ -136,6 +138,10 @@ impl Gdrive {
     /// 解析配置根下的相对路径；结尾 `/` 视为文件夹期望。
     /// 同名多义时拒绝（Drive 允许同目录同名文件）。
     pub async fn resolve(&self, path: &str) -> Result<Resolved> {
+        let relative = path.strip_suffix('/').unwrap_or(path);
+        if path != "/" && !waybill::object::valid_object_path(relative) {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid Drive path"));
+        }
         let expects_folder = path.ends_with('/');
         let segments: Vec<&str> = path
             .trim_matches('/')
@@ -212,6 +218,7 @@ impl Gdrive {
     pub(crate) fn media(&self, reference: &str) -> Result<GdriveMedia> {
         validate_id(reference)?;
         Ok(GdriveMedia {
+            service: self.identity.clone(),
             api: Arc::clone(&self.api),
             reference: reference.to_string(),
         })

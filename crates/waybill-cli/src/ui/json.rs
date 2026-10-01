@@ -75,6 +75,7 @@ fn encode(event: Event) -> Value {
             "target": receipt.target,
             "object": receipt.object,
             "size": receipt.size,
+            "verified": receipt.verified,
         }),
         Event::Failed {
             index,
@@ -126,5 +127,6 @@ mod tests {
         assert_eq!(value["type"], "completed");
         assert_eq!(value["object"], "obj-1");
         assert_eq!(value["service"], "waybill:gdrive");
+        assert_eq!(value["verified"], "Unverified");
     }
 }

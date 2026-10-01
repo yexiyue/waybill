@@ -243,6 +243,10 @@ mod tests {
                 instance: "local".into(),
             },
             source: RemoteIdentity {
+                service: ServiceIdentity {
+                    service: ServiceId::parse("test:remote").unwrap(),
+                    instance: "source-account".into(),
+                },
                 reference: "drive-file-1".into(),
                 revision: "3:abc:16".into(),
                 size: 16 * 1024 * 1024,

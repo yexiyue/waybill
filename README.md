@@ -1,184 +1,179 @@
 # waybill
 
 <p align="center">
-  <img src="assets/brand/readme-banner-v1.png" alt="waybill — Bill the courier goose with a waybill tube strapped to his leg" width="960">
+  <img src="assets/brand/readme-banner-v1.png" alt="waybill: Bill the courier goose with a waybill tube on his leg" width="960">
 </p>
 
 <p align="center">
   <strong>Resumable delivery. Both ways.</strong><br>
-  A Rust library for moving files between local storage and the cloud.
+  A Rust file transfer library and CLI connecting local storage with the cloud.
 </p>
 
 <p align="center">
   <a href="README.zh-CN.md">简体中文</a> ·
   <a href="docs/DESIGN.zh-CN.md">Design</a> ·
-  <a href="docs/BRAND.zh-CN.md">Meet Bill</a> ·
+  <a href="docs/STATUS.zh-CN.md">Project status</a> ·
   <a href="https://github.com/yexiyue/waybill/actions/workflows/ci.yml">CI</a>
 </p>
 
-> **Early development · M2 download prototype, unpublished.** Public upload and
-> download contracts, stable local sources, file checkpoints, GDrive resumable
-> uploads and reconciliation, GDrive ranged downloads with `.part` recovery and
-> atomic local publication, and an independent consumer example are implemented.
-> Download-side acceptance is local so far; live Google acceptance is pending.
-> Local fault tests and live Google upload acceptance are reported separately in
-> [validation notes](docs/VALIDATION.zh-CN.md).
+waybill saves durable progress and completion receipts for uploads and downloads.
+After an interruption, rerun the same command to validate the source and saved
+state, then continue the transfer or reuse the completed result.
 
-## Delivery that can pick up where it stopped
+Use `wb` to manage Google Drive files, or embed transfers in an application through
+the public Rust interfaces. The name comes from the document that travels with a
+shipment; [Bill](docs/BRAND.zh-CN.md) is our courier goose.
 
-A large transfer can outlive its process. A connection drops, an app restarts,
-or the destination becomes unavailable just as the file is ready to publish.
-waybill is being designed to preserve enough state to continue safely.
+## Features
 
-The name comes from a **waybill**: the document that travels with a shipment,
-recording its identity, progress, and delivery receipt.
+- **Two-way transfers**: Google Drive uploads, downloads, and directory browsing.
+- **Durable recovery**: checkpoints reconcile source versions, remote sessions, or local staging data before resuming.
+- **Interactive selection**: named drives, default roots, local and cloud file selection, and a fullscreen transfer dashboard.
+- **Scripting**: complete arguments run directly, with line-delimited JSON events and plain progress output.
+- **Safe publication**: download verification and same-filesystem publication without overwriting; failed publication retains retryable state.
+- **Open extensions**: independent services declare their capabilities and recovery guarantees through public contracts.
 
-| Design goal | What it means |
-|---|---|
-| **Durable recovery** | Versioned checkpoints bind progress to a source and destination. Recovery reconciles persisted data or the remote session before continuing. |
-| **Receipt-based retries** | An operation ID and completion evidence help retries converge, within each service's guarantees. |
-| **Bounded resources** | Chunk sizes, concurrency, prefetch, and buffers share an explicit budget. |
-| **Honest capabilities** | Upload recovery, download recovery, version checks, and publishing guarantees are declared separately. |
+waybill handles file delivery. Directory synchronization, conflict merging, and
+multi-device synchronization are outside the current feature set.
 
-For downloads, the planned lifecycle is: read missing ranges, write a local
-.part file, persist confirmed progress, validate, then publish. A failed publish
-keeps staging data available for another attempt.
+## Installation
 
-For uploads, the service determines whether recovery uses a continuous offset,
-multipart state, or a full restart. A caller that requires durable recovery can
-reject an unsuitable service before starting.
-
-## One engine, independently implemented services
-
-```mermaid
-flowchart LR
-    LocalSource[Local file source] --> Engine[Transfer engine]
-    CloudSource[Cloud object source] --> Engine
-    Engine --> LocalSink[Local staging and publish]
-    Engine --> CloudSink[Cloud upload session]
-    Engine --> Checkpoint[Checkpoint store]
-```
-
-The core provides Service, Source, UploadSink, capabilities, checkpoints and upload
-scheduling. GDrive owns its short-lived token interface; the host owns authorization
-and refresh. Each service implements a
-backend through those public contracts.
-
-**The services maintained here use the same extension boundary as services
-written by other developers.** An external service should be able to live in its
-own crate, depend on waybill, and be injected without adding a provider enum
-variant or changing the engine.
-
-| Service / status | Role |
-|---|---|
-| waybill-service-fs · prototype | Stable local sources, range reads, BLAKE3 validation, file checkpoints, and the local download target (`.part` staging, verification, atomic publication) |
-| waybill-service-gdrive · prototype | Google Drive uploads, resumable sessions, completion reconciliation, and ranged downloads with path resolution |
-| waybill-service-webdav · planned | Streaming uploads, range downloads, and declared server capabilities |
-| waybill-service-oss · planned | Aliyun OSS access, multipart sessions, and part reconciliation |
-| External service crates | Additional backends using the same public extension contracts |
-
-A read-only service can participate without implementing uploads. The
-[independent consumer](examples/consumer/) uses only public APIs; the
-[service guide](docs/SERVICE.zh-CN.md) describes the implemented contracts.
-APIs are 0.x prototypes. Operator and registry sketches remain design material.
-
-`UploadEngine` validates the source, instance, and remote state before resuming.
-Expired sessions return `SessionExpired` and retain their checkpoint by default.
-Explicit permission permits at most two restarts per run. Receipts are persisted
-before success; call `confirm` only after committing host bookkeeping. The host
-must freeze the source and owns its cleanup.
-
-## Working with the Rust storage ecosystem
-
-The design draws on access and multipart primitives from OpenDAL and
-object_store. Protocol clients, HTTP transports, and signing libraries can be
-reused while waybill owns the transfer lifecycle and its recovery state.
-
-An optional OpenDAL service may follow a concrete demand for another backend.
-Range reads and source-version checks can be combined with local checkpoints
-for download recovery. Upload-session recovery needs separate backend support.
-
-Each service declares its guarantees. A WebDAV MOVE, an object key, or an ETag
-alone does not establish universal atomicity, content integrity, or exactly-once
-delivery. The [design document](docs/DESIGN.zh-CN.md) records the research and
-proposed boundaries.
-
-The initial implementation uploads local files to GDrive; the long-term scope is
-file delivery between local and cloud storage. Directory
-sync, conflict merging, and multi-device synchronization are outside that scope.
-
-## Roadmap
-
-| Milestone | Planned outcome |
-|---|---|
-| **M0** | Open contracts and versioned checkpoints |
-| **M1 — done** | Stable local sources, GDrive upload recovery, and independent consumer integration (real-Drive accepted) |
-| **CLI — in progress** | The `wb` command line (login / put / get / list / status): GDrive upload and download loops with a fullscreen dashboard and a `--json` event stream |
-| **M2 — in progress** | GDrive downloads, local staging, recovery and publication (locally validated; real-Drive acceptance pending) |
-| **M3** | WebDAV and a real-server compatibility matrix |
-| **M4** | OSS multipart recovery and completion reconciliation |
-| **On demand** | OpenDAL adapter, starting with a concrete additional backend and its download path |
-
-The first intended consumer is
-[SwarmDrop](https://github.com/swarm-apps/SwarmDrop). Its existing local-file and
-Drive delivery implementations provide the starting material. waybill's public
-contracts remain independent of its UI, device identity, and P2P protocol.
-
-## Use wb
+Supports Linux and macOS. Requires **Rust 1.88 or newer**. Install `wb` from source:
 
 ```sh
-cargo run -p waybill-cli -- login gdrive --client /path/to/desktop.json
-cargo run -p waybill-cli -- put ./file.zip 'gdrive://account@example.com/backup/'
-cargo run -p waybill-cli -- list 'gdrive://account@example.com/backup/'
-cargo run -p waybill-cli -- get 'gdrive://account@example.com/backup/file.zip' ./file.zip
-cargo run -p waybill-cli -- status
+git clone https://github.com/yexiyue/waybill.git
+cd waybill
+cargo install --path crates/waybill-cli --locked
+wb --help
 ```
 
-Authorization requests `drive.file` for app-owned uploads and `drive.readonly`
-for reading Drive files. Login uses your Google email as the account name;
-`--account` sets a local alias. Multiple sources require a destination ending in
-`/`. Directories must belong to this app, or use `--root <folder ID>` for an
-app-accessible root. `list` browses Drive folders; `get` fetches a file — an
-existing directory destination takes the remote file name, and a remote update
-starts a fresh waybill. Downloads verify the server-provided MD5, publish
-atomically on the same filesystem, and reject cross-device destinations.
-A TTY opens the fullscreen dashboard; `--no-tui` selects plain output and
-`--json` streams events. The first Ctrl-C stops gracefully; the second aborts
-immediately. Rerun the same command to resume or reuse the completed receipt.
-`status` lists pending and completed records per direction. Removing local
-completion records removes the skip guarantee.
+Inside the repository, you can also use `cargo run -p waybill-cli -- <command>`.
+No stable release has been published, and public APIs may change. Release plans
+and validation coverage are recorded in [project status](docs/STATUS.zh-CN.md).
 
-## Meet Bill
+## Quick start
 
-<p align="center">
-  <img src="assets/brand/bill-mascot-v1.png" alt="Bill, a cream-and-grey courier goose with an orange bill and a teal document tube on his leg" width="240">
-</p>
+Prepare a Google OAuth **desktop application** client JSON and enable the Drive
+API in its Google Cloud project. Sign in, then configure a drive with your account:
 
-**Bill**, known as **雁哥** in Chinese, is our courier goose. His two-way migration
-fits the library's two-way delivery, and the tube on his leg keeps the waybill
-close throughout the journey.
+```sh
+wb login gdrive --client /path/to/desktop.json
+wb drive add personal --account account@example.com
+```
 
-The [brand guide](docs/BRAND.zh-CN.md) includes the mascot, avatar, README banner,
-social cover, and generation prompts.
+Replace `account@example.com` with your Google account email, or the alias supplied
+with `login --account`. The first drive becomes the default. Choose a cloud folder
+as the starting point for subsequent short paths:
+
+```sh
+wb drive root personal
+```
+
+You can now work without repeating a full cloud URI:
+
+```sh
+wb list                       # Browse the default drive
+wb put                        # Select local files, then a cloud destination
+wb get --into ~/Downloads     # Select cloud files for an existing local directory
+wb status                     # Inspect pending records and completion receipts
+```
+
+Authorization uses `drive.file` to create and modify app-owned files and
+`drive.readonly` to read Drive. Credentials stay in a private local directory;
+upload destinations must still satisfy Google Drive's app access permissions.
+
+## Commands and interaction
+
+| Command | Purpose |
+|---|---|
+| `wb login gdrive` | Sign in to Google Drive |
+| `wb drive add / list / use / root / remove` | Manage named drives, the default drive, and roots |
+| `wb list [PATH]` | List a directory, or browse interactively without a path |
+| `wb put [SRC…] --to PATH` | Upload files; select missing sources or destinations interactively |
+| `wb get [SOURCE] [DEST]` | Download files; select missing sources or destinations interactively |
+| `wb status` | List local recovery records and completion receipts |
+
+In a picker, Enter opens a folder, Space selects files, `c` confirms, ← / Backspace
+goes up, and `q` / Esc / Ctrl-C cancels. Selections persist across folders.
+
+Transfers show a fullscreen dashboard by default; `--no-tui` uses plain output.
+The first Ctrl-C stops gracefully, and the second aborts immediately. Keep the
+source files, drive configuration, and local records to resume with the same command.
+
+### Direct commands and scripts
+
+Complete arguments run a transfer directly. Paths are relative to the selected
+drive's default root; `/` means that root. A batch upload destination ends in `/`.
+
+```sh
+wb put ./a.zip ./b.zip --to backup/
+wb list backup/
+wb get backup/a.zip ./a.zip
+wb --drive work list /
+wb --json put ./a.zip --to backup/
+wb get backup/a.zip ./a.zip --no-tui
+```
+
+`--drive NAME` selects a drive for one command; `--root ID` overrides its root.
+`wb drive use NAME` changes the default. `wb drive remove NAME` keeps credentials
+and recovery records.
+
+An explicit account and full URI also work:
+
+```sh
+wb get 'gdrive://account@example.com/backup/a.zip' ./a.zip
+```
+
+Full URIs start at the Google root unless overridden with `--root`, and cannot be
+combined with `--drive`. JSON output, `--no-tui`, and non-terminal sessions never
+open a picker; missing required arguments produce an error. See
+`wb <command> --help` for all options.
+
+### Files and publication
+
+Batch downloads require an existing local directory. Identical names from
+different cloud folders are rejected before transferring. Google native documents
+can be browsed but are not exported, and folders are not downloaded recursively.
+Downloads publish on the same filesystem without overwriting existing files;
+cross-filesystem copy publication is unsupported. Use `--conflict operation-suffix`
+to keep another copy when a name conflicts.
+
+## Rust integration
+
+| Crate | Responsibility |
+|---|---|
+| [`waybill`](crates/waybill/) | Upload and download contracts, transfer engines, capabilities, and checkpoints |
+| [`waybill-service-fs`](crates/waybill-service-fs/) | Stable local sources, file checkpoints, download staging, and publication |
+| [`waybill-service-gdrive`](crates/waybill-service-gdrive/) | Google Drive protocol, upload reconciliation, ranged reads, and directory access |
+| [`waybill-cli`](crates/waybill-cli/) | `wb`: authorization, drive configuration, interaction, and transfer orchestration |
+
+The core is independent of backends and executors. Hosts own authorization and
+credential refresh; services obtain valid credentials at request boundaries.
+External services use the same public interfaces as the services in this workspace,
+implementing uploads, downloads, and recovery according to their capabilities.
+
+Start with the [independent consumer example](examples/consumer/), or read the
+[service guide](docs/SERVICE.zh-CN.md) and [design document](docs/DESIGN.zh-CN.md).
+The detailed documentation is currently in Simplified Chinese.
 
 ## Contributing
 
-Start with the [design document](docs/DESIGN.zh-CN.md). Contributions around the
-public service boundary, recovery behavior, and real backend constraints are
-especially useful at this stage. Local fault tests and live Drive upload / process
-recovery have passed; see the [validation record](docs/VALIDATION.zh-CN.md) for the
-exact scope and remaining gaps.
+Issues and pull requests are welcome. For recovery changes or new backends,
+describe the use case, backend capabilities, and expected behavior after failure.
+The [design document](docs/DESIGN.zh-CN.md) records architectural constraints.
 
-The workspace uses **Rust 2024**, with a declared minimum Rust version of **1.88**.
-To check the current implementation:
+The workspace uses Rust 2024. Before submitting a change, run:
 
 ```sh
+cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Please discuss a service's capabilities and recovery guarantees before building
-against the API sketches. The sketches are design material and may change.
+Use dedicated files and folders for live backend tests. Keep credentials and
+private session state out of contributions. Existing validation and remaining
+test scenarios are recorded in the [validation notes](docs/VALIDATION.zh-CN.md).
 
 ## License
 

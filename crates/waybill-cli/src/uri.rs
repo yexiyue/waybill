@@ -3,13 +3,13 @@
 //! 不用 url crate 解析：账户通常是电子邮件，`@` 会被误拆成 userinfo/host。
 //! 路径按字面使用，不做百分号解码；shell 引号已覆盖转义需求。
 use waybill::error::{Error, ErrorKind, Result};
-use waybill::upload::{ConflictPolicy, UploadIntent};
+use waybill::object::valid_object_path;
 
 const SCHEME: &str = "gdrive://";
 
-/// 解析后的上传目标；首期仅 Google Drive。
+/// 解析后的云对象位置；上传、下载与列表共用。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Destination {
+pub struct DriveUri {
     /// 账户标识，对应 `wb login` 保存的凭证目录。
     pub account: String,
     /// 相对根目录的目标或目录前缀；不以 `/` 开头，可为空（仅目录前缀）。
@@ -18,7 +18,15 @@ pub struct Destination {
     pub directory: bool,
 }
 
-impl Destination {
+impl DriveUri {
+    pub fn to_uri(&self) -> String {
+        let suffix = if self.directory && !self.target.is_empty() {
+            "/"
+        } else {
+            ""
+        };
+        format!("gdrive://{}/{}{suffix}", self.account, self.target)
+    }
     /// 目录前缀拼接文件名，得到单个源的目标路径。
     pub fn join(&self, file_name: &str) -> Result<String> {
         if !self.directory {
@@ -34,8 +42,8 @@ impl Destination {
     }
 }
 
-/// 解析并复用公开上传契约校验路径，在读取凭证之前拒绝无效目标。
-pub fn parse(uri: &str) -> Result<Destination> {
+/// 解析并复用公开对象路径约束，在读取凭证之前拒绝无效目标。
+pub fn parse(uri: &str) -> Result<DriveUri> {
     let rest = uri.strip_prefix(SCHEME).ok_or_else(invalid)?;
     let (account, path) = rest.split_once('/').ok_or_else(invalid)?;
     if !safe_account(account) || path.contains("//") {
@@ -50,7 +58,7 @@ pub fn parse(uri: &str) -> Result<Destination> {
     if !target.is_empty() {
         validate_target(&target)?;
     }
-    Ok(Destination {
+    Ok(DriveUri {
         account: account.to_string(),
         target,
         directory,
@@ -69,23 +77,32 @@ pub fn safe_account(account: &str) -> bool {
 }
 
 fn validate_target(target: &str) -> Result<()> {
-    UploadIntent {
-        operation: "uri-validation".into(),
-        target: target.into(),
-        conflict: ConflictPolicy::Reject,
+    if valid_object_path(target) {
+        Ok(())
+    } else {
+        Err(invalid())
     }
-    .validate()
-    .map_err(|_| invalid())
 }
 
 fn invalid() -> Error {
-    Error::new(ErrorKind::InvalidInput, "invalid destination URI")
+    Error::new(ErrorKind::InvalidInput, "invalid Drive URI")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use waybill::error::ErrorKind;
+
+    #[test]
+    fn formatting_preserves_root_and_directory_without_double_slashes() {
+        for value in [
+            "gdrive://bill/",
+            "gdrive://bill/backup/",
+            "gdrive://bill/a.bin",
+        ] {
+            assert_eq!(parse(value).unwrap().to_uri(), value);
+        }
+    }
 
     #[test]
     fn parses_account_and_prefix() {

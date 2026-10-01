@@ -1,14 +1,17 @@
 //! `wb get`：从云盘取回单个文件；重跑同一命令即续传或回执幂等跳过。
 use crate::{
     cli::GetArgs,
-    cmd::put::{install_ctrl_c, paused},
+    cmd::session,
     error::CliError,
     gdrive_host,
     paths::Layout,
     transfer::{DownloadJob, DownloadRunner},
-    ui, uri,
+    uri,
 };
-use std::{io::IsTerminal, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use waybill::{
     budget::ResourceBudget,
     download::{DownloadEngine, DownloadIntent},
@@ -16,7 +19,7 @@ use waybill::{
     service::Service,
 };
 use waybill_service_fs::{FileCheckpointStore, FsService};
-use waybill_service_gdrive::Resolved;
+use waybill_service_gdrive::{Gdrive, RemoteFile, Resolved};
 
 /// CLI 本地目标的稳定实例命名空间；重跑必须命中同一实例。
 const LOCAL_INSTANCE: &str = "wb-local-v1";
@@ -36,12 +39,19 @@ pub async fn run(args: GetArgs, json: bool, verbose: u8) -> Result<(), CliError>
             "get 的源 URI 指向目录；去掉结尾 / 指向文件，或使用 wb list 浏览".into(),
         ));
     }
-    // 预检先于凭证加载：URI 与本地目标在登录检查前给出明确错误。
-    if dest.to_string_lossy().ends_with('/') {
-        return Err(CliError::Message(
-            "get 的本地目标不能以 / 结尾；目录会自动展开为 远端文件名".into(),
-        ));
+    // 稳定绝对路径和意图校验先于账户加载；不存在的父目录同样可规范化。
+    let dest = normalize_destination(&dest)?;
+    let preflight_target = if dest.is_dir() {
+        dest.join("wb-preflight")
+    } else {
+        dest.clone()
+    };
+    DownloadIntent {
+        operation: operation.clone().unwrap_or_else(|| "wb-preflight".into()),
+        target: utf8_path(&preflight_target)?.into(),
+        conflict: conflict.into(),
     }
+    .validate()?;
     let layout = Layout::discover()?;
     let root = root.as_deref().unwrap_or("root");
     let drive = gdrive_host::build(&layout, &source.account, root).await?;
@@ -59,97 +69,126 @@ pub async fn run(args: GetArgs, json: bool, verbose: u8) -> Result<(), CliError>
             )));
         }
     };
-    let name = sanitize_remote_name(&file.name)?;
-    // 本地目标：已存在目录时展开远端文件名，否则按给出的路径。
-    let target_path = if dest.is_dir() {
-        dest.join(&name)
-    } else {
-        dest.clone()
-    };
-    let target = target_path.to_string_lossy().into_owned();
-    DownloadIntent {
-        operation: operation.clone().unwrap_or_else(|| "wb-preflight".into()),
-        target: target.clone(),
-        conflict: conflict.into(),
-    }
-    .validate()?;
-    let download_source = drive.download_source(&file.id).await?;
-    let local = FsService::new(LOCAL_INSTANCE)?;
-    let target_sink = local.download_target()?;
-    let store = FileCheckpointStore::new(layout.checkpoints());
-    let engine = DownloadEngine::new(Arc::new(ResourceBudget::default()));
-    let stop = waybill::upload::StopToken::default();
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    let handle = tokio::spawn(
-        DownloadRunner {
-            source: download_source,
-            target: target_sink,
-            store,
-            engine,
-            stop: stop.clone(),
-            conflict: conflict.into(),
-            events: tx,
-        }
-        .run(
-            DownloadJob {
-                reference: file.id.clone(),
-                name,
-                target: target.clone(),
-            },
+    run_files(
+        &drive,
+        vec![file],
+        dest,
+        crate::cli::TransferArgs {
             operation,
-        ),
-    );
-    let abort = handle.abort_handle();
-    let interactive =
-        !json && !no_tui && std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
-    let rendered = if json {
-        install_ctrl_c(stop.clone(), abort.clone());
-        ui::json::run(rx).await
-    } else if interactive {
-        // 面板接管按键与 Ctrl-C；非 TTY 或 --no-tui 走行式输出。
-        ui::tui::run(ui::tui::Handoff {
-            receiver: rx,
-            stop: stop.clone(),
-            banner: format!("get · {} · {} → {}", source.account, source.target, target),
-            queued_files: vec![(file.name.clone(), target.clone())],
-        })
-        .await
-        .map(|forced| {
-            if forced {
-                abort.abort();
-            }
-        })
-    } else {
-        install_ctrl_c(stop.clone(), abort.clone());
-        ui::plain::run(rx, 1, verbose > 0).await
-    };
-    if rendered.is_err() {
-        // 输出通道断裂：先请求停止再收割任务，避免孤儿传输。
-        stop.stop();
-    }
-    let outcome = match handle.await {
-        Ok(outcome) => outcome,
-        Err(error) if error.is_cancelled() => return Err(paused()),
-        Err(_) => return Err(CliError::Message("传输任务异常退出".into())),
-    };
-    rendered?;
-    if outcome.stopped {
-        return Err(paused());
-    }
-    if outcome.failures > 0 {
-        return Err(CliError::Message(
-            "取回失败；重跑同一命令可续传或幂等跳过".into(),
-        ));
-    }
-    Ok(())
+            conflict,
+            root: None,
+            no_tui,
+        },
+        json,
+        verbose,
+    )
+    .await
 }
 
-/// 远端文件名落到本地：Drive 名不含 `/`，仍拒绝路径分量与控制字符。
+pub(super) async fn run_files(
+    drive: &Gdrive,
+    files: Vec<RemoteFile>,
+    dest: PathBuf,
+    options: crate::cli::TransferArgs,
+    json: bool,
+    verbose: u8,
+) -> Result<(), CliError> {
+    if files.is_empty() {
+        return Err(CliError::Message("没有选择文件".into()));
+    }
+    if files.len() > 1 && (!dest.is_dir() || options.operation.is_some()) {
+        return Err(CliError::Message(
+            "多文件下载需要现有本地目录，且不能指定 --operation".into(),
+        ));
+    }
+    let dest = normalize_destination(&dest)?;
+    let mut jobs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // 全部目标预检完成后才开始传输，避免选择集合中的重名造成部分交付。
+    for file in files {
+        let target_path = if dest.is_dir() {
+            dest.join(sanitize_remote_name(&file.name)?)
+        } else {
+            dest.clone()
+        };
+        let target = utf8_path(&target_path)?.to_owned();
+        DownloadIntent {
+            operation: options
+                .operation
+                .clone()
+                .unwrap_or_else(|| "wb-preflight".into()),
+            target: target.clone(),
+            conflict: options.conflict.into(),
+        }
+        .validate()?;
+        if !seen.insert(target.clone()) {
+            return Err(CliError::Message(format!(
+                "所选文件存在同名本地目标：{target}"
+            )));
+        }
+        jobs.push(DownloadJob {
+            source: drive.download_source(&file.id).await?,
+            name: file.name,
+            target,
+        });
+    }
+    let local = FsService::new(LOCAL_INSTANCE)?;
+    let stop = waybill::upload::StopToken::default();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let queued_files = jobs
+        .iter()
+        .map(|job| (job.name.clone(), job.target.clone()))
+        .collect();
+    let handle = tokio::spawn(
+        DownloadRunner {
+            target: local.download_target()?,
+            store: FileCheckpointStore::new(Layout::discover()?.checkpoints()),
+            engine: DownloadEngine::new(Arc::new(ResourceBudget::default())),
+            stop: stop.clone(),
+            conflict: options.conflict.into(),
+            events: tx,
+        }
+        .run(jobs, options.operation),
+    );
+    session::run(
+        handle,
+        rx,
+        stop,
+        session::Settings {
+            banner: format!("get · {}", dest.display()),
+            queued_files,
+            json,
+            verbose: verbose > 0,
+            no_tui: options.no_tui,
+        },
+    )
+    .await
+}
+
+fn utf8_path(path: &Path) -> Result<&str, CliError> {
+    path.to_str()
+        .ok_or_else(|| CliError::Message("本地路径必须是有效 UTF-8".into()))
+}
+
+pub(super) fn normalize_destination(path: &Path) -> Result<PathBuf, CliError> {
+    let raw = utf8_path(path)?;
+    if raw.is_empty() || (raw.ends_with('/') && !path.is_dir()) {
+        return Err(CliError::Message(
+            "以 / 结尾的本地目标必须是已存在目录".into(),
+        ));
+    }
+    soft_canonicalize::soft_canonicalize(path)
+        .map_err(|error| CliError::Message(format!("无法解析本地目标：{error}")))
+}
+
+/// 目录展开只能使用单个安全文件名，禁止云端名称改变目标路径。
 fn sanitize_remote_name(name: &str) -> Result<String, CliError> {
     if name.is_empty()
         || name == "."
         || name == ".."
-        || name.chars().any(|c| c.is_control())
+        || name
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
         || name.len() > 255
     {
         return Err(CliError::Waybill(Error::new(
@@ -193,9 +232,39 @@ mod tests {
     }
 
     #[test]
+    fn local_paths_are_absolute_and_resolve_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = normalize_destination(&dir.path().join("missing/../out.bin")).unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(path, dir.path().canonicalize().unwrap().join("out.bin"));
+        assert_eq!(
+            normalize_destination(&dir.path().join("./")).unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_operation_fails_before_account_loading() {
+        let mut input = args("gdrive://missing-account/a.bin", "./a.bin");
+        input.operation = Some("../invalid".into());
+        assert!(matches!(run(input, false, 0).await,
+            Err(CliError::Waybill(e)) if e.kind == ErrorKind::InvalidInput));
+    }
+
+    #[test]
     fn remote_names_are_sanitized_for_local_use() {
         assert_eq!(sanitize_remote_name("a.zip").unwrap(), "a.zip");
-        for bad in ["", ".", "..", "a\tb", &"a".repeat(256)] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "a\tb",
+            &"a".repeat(256),
+        ] {
             assert!(sanitize_remote_name(bad).is_err(), "{bad:?}");
         }
     }

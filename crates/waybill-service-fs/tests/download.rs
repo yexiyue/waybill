@@ -43,6 +43,10 @@ impl PatternSource {
     }
     fn identity(&self) -> waybill::download::RemoteIdentity {
         waybill::download::RemoteIdentity {
+            service: ServiceIdentity {
+                service: ServiceId::parse("test:pattern").unwrap(),
+                instance: "source-account".into(),
+            },
             reference: "pattern-source".into(),
             revision: "1".into(),
             size: self.size,
@@ -113,6 +117,30 @@ async fn run(
         )
         .await
 }
+fn staging_paths(dest: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dest.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".wb-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "part")
+        })
+        .collect()
+}
+fn staging(dest: &std::path::Path) -> std::path::PathBuf {
+    let paths = staging_paths(dest);
+    assert_eq!(
+        paths.len(),
+        1,
+        "one private staging file expected: {paths:?}"
+    );
+    paths[0].clone()
+}
 fn expected_bytes(size: u64) -> Vec<u8> {
     (0..size).map(PatternSource::byte_at).collect()
 }
@@ -141,10 +169,7 @@ async fn engine_publishes_verified_content_and_removes_staging() {
         other => panic!("expected digest evidence, got {other:?}"),
     }
     assert_eq!(std::fs::read(&dest).unwrap(), expected_bytes(100));
-    assert!(
-        !dest.with_extension("dat.part").exists(),
-        ".part 必须已发布"
-    );
+    assert!(staging_paths(&dest).is_empty(), "暂存必须已发布");
     // confirm 后记录清除。
     let store = FileCheckpointStore::new(dir.path().join("cp"));
     engine(16, 2).confirm(&store, &receipt).await.unwrap();
@@ -184,7 +209,7 @@ async fn out_of_order_writes_land_at_exact_offsets() {
             .await
             .unwrap();
     }
-    target
+    let state = target
         .verify(&reverse_intent, &identity, &state)
         .await
         .unwrap();
@@ -209,7 +234,7 @@ async fn part_length_is_not_completion_evidence() {
         .initialize(&preset_intent, &identity, &state)
         .await
         .unwrap();
-    let part = dest.with_extension("bin.part");
+    let part = staging(&dest);
     // 预分配让 .part 已是完整长度，但没有任何区间记账。
     assert_eq!(std::fs::metadata(&part).unwrap().len(), 48);
     let store = FileCheckpointStore::new(dir.path().join("cp"));
@@ -251,7 +276,7 @@ async fn tampered_staging_is_rebuilt_not_trusted() {
     .await;
     assert!(matches!(first, Err(e) if e.kind == ErrorKind::Paused));
     // 截断暂存：长度与账本不再互证，必须整体重建。
-    let part = dest.with_extension("bin.part");
+    let part = staging(&dest);
     let file = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
     file.set_len(10).unwrap();
     drop(file);
@@ -283,7 +308,7 @@ async fn corrupted_persisted_region_is_caught_by_final_digest() {
     .await;
     assert!(matches!(first, Err(e) if e.kind == ErrorKind::Paused));
     // 篡改已记账区间的字节：账本无法察觉，终态摘要校验必须拦截。
-    let part = dest.with_extension("bin.part");
+    let part = staging(&dest);
     let file = std::fs::OpenOptions::new().write(true).open(&part).unwrap();
     use std::os::unix::fs::FileExt;
     file.write_all_at(&[0xFF, 0xFF], 4).unwrap();
@@ -328,7 +353,7 @@ async fn late_destination_conflict_keeps_staging_and_rerun_publishes_only() {
     .await;
     assert!(matches!(first, Err(e) if e.kind == ErrorKind::Conflict));
     let reads_after_first = progress_calls.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(dest.with_extension("bin.part").exists(), ".part 必须保留");
+    assert!(staging(&dest).exists(), ".part 必须保留");
     std::fs::remove_file(&dest).unwrap();
     let receipt = run(
         100,
@@ -551,4 +576,318 @@ async fn service_identity_binds_the_target_instance() {
     };
     let target = service().download_target().unwrap();
     assert_eq!(target.identity(), identity);
+}
+
+#[tokio::test]
+async fn published_same_length_corruption_is_not_a_verified_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("published.bin");
+    let checkpoints = dir.path().join("cp");
+    run(
+        100,
+        "published-op",
+        &dest,
+        &checkpoints,
+        &StopToken::default(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    std::fs::write(&dest, [0xFF; 100]).unwrap();
+    let result = run(
+        100,
+        "published-op",
+        &dest,
+        &checkpoints,
+        &StopToken::default(),
+        &|_| {},
+    )
+    .await;
+    assert!(matches!(result, Err(e) if e.kind == ErrorKind::Checkpoint));
+    assert_eq!(std::fs::read(&dest).unwrap(), [0xFF; 100]);
+}
+
+#[tokio::test]
+async fn verified_staging_is_rechecked_before_publish_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("verified.bin");
+    let checkpoints = dir.path().join("cp");
+    let first = run(
+        100,
+        "verified-op",
+        &dest,
+        &checkpoints,
+        &StopToken::default(),
+        &|p| {
+            if p.persisted == p.total {
+                std::fs::write(&dest, b"occupied").unwrap();
+            }
+        },
+    )
+    .await;
+    assert!(matches!(first, Err(e) if e.kind == ErrorKind::Conflict));
+    let part = staging(&dest);
+    std::fs::write(&part, [0xFF; 100]).unwrap();
+    std::fs::remove_file(&dest).unwrap();
+    let result = run(
+        100,
+        "verified-op",
+        &dest,
+        &checkpoints,
+        &StopToken::default(),
+        &|_| {},
+    )
+    .await;
+    assert!(matches!(result, Err(e) if e.kind == ErrorKind::Checkpoint));
+    assert!(part.exists());
+    assert!(!dest.exists());
+}
+
+#[tokio::test]
+async fn independent_operations_have_private_staging_and_no_clobber_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("shared.bin");
+    let source = PatternSource::new(48);
+    let target = service().download_target().unwrap();
+    let identity = source.identity();
+    let first = intent("first-op", &dest);
+    let second = intent("second-op", &dest);
+    let a = target.prepare(&first, &identity).await.unwrap();
+    let b = target.prepare(&second, &identity).await.unwrap();
+    let (a, b) = tokio::join!(
+        target.initialize(&first, &identity, &a),
+        target.initialize(&second, &identity, &b)
+    );
+    let DownloadStatus::Ready { state: a, .. } = a.unwrap() else {
+        panic!("ready");
+    };
+    let DownloadStatus::Ready { state: b, .. } = b.unwrap() else {
+        panic!("ready");
+    };
+    assert_eq!(staging_paths(&dest).len(), 2);
+    let a = target
+        .write_chunk(&first, &identity, &a, 0, expected_bytes(48))
+        .await
+        .unwrap();
+    let b = target
+        .write_chunk(&second, &identity, &b, 0, expected_bytes(48))
+        .await
+        .unwrap();
+    let a = target.verify(&first, &identity, &a).await.unwrap();
+    let b = target.verify(&second, &identity, &b).await.unwrap();
+    let (a, b) = tokio::join!(
+        target.publish(&first, &identity, &a),
+        target.publish(&second, &identity, &b)
+    );
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let failure = match (a, b) {
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => error,
+        _ => panic!("exactly one operation must publish"),
+    };
+    assert_eq!(failure.kind, ErrorKind::Conflict);
+    assert_eq!(std::fs::read(&dest).unwrap(), expected_bytes(48));
+    assert_eq!(
+        staging_paths(&dest).len(),
+        1,
+        "losing operation retains its bytes"
+    );
+}
+
+#[tokio::test]
+async fn preexisting_part_symlink_is_untouched_and_replaced_private_staging_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("safe.bin");
+    let external = dir.path().join("external.bin");
+    std::fs::write(&external, b"preserve").unwrap();
+    std::os::unix::fs::symlink(&external, dest.with_extension("bin.part")).unwrap();
+    let source = PatternSource::new(48);
+    let target = service().download_target().unwrap();
+    let identity = source.identity();
+    let request = intent("safe-op", &dest);
+    let state = target.prepare(&request, &identity).await.unwrap();
+    let DownloadStatus::Ready { state, .. } = target
+        .initialize(&request, &identity, &state)
+        .await
+        .unwrap()
+    else {
+        panic!("ready");
+    };
+    assert_eq!(std::fs::read(&external).unwrap(), b"preserve");
+    let part = staging(&dest);
+    std::fs::remove_file(&part).unwrap();
+    std::os::unix::fs::symlink(&external, &part).unwrap();
+    let result = target
+        .write_chunk(&request, &identity, &state, 0, expected_bytes(48))
+        .await;
+    assert!(matches!(result, Err(e) if e.kind == ErrorKind::Checkpoint));
+    assert_eq!(std::fs::read(&external).unwrap(), b"preserve");
+}
+
+#[tokio::test]
+async fn conflict_suffix_uses_file_name_in_dotted_parent_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("backup.v2");
+    std::fs::create_dir(&parent).unwrap();
+    let dest = parent.join("no-extension");
+    std::fs::write(&dest, b"original").unwrap();
+    let source = PatternSource::new(48);
+    let target = service().download_target().unwrap();
+    let store = FileCheckpointStore::new(dir.path().join("cp"));
+    let mut request = intent("dotted-op", &dest);
+    request.conflict = ConflictPolicy::OperationSuffix;
+    let receipt = engine(16, 2)
+        .run(
+            &source,
+            target.as_ref(),
+            &store,
+            DownloadOptions {
+                intent: request,
+                stop: &StopToken::default(),
+                progress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
+    let published = std::path::Path::new(&receipt.object);
+    assert_eq!(published.parent(), Some(parent.as_path()));
+    assert!(
+        published
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("no-extension-")
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+}
+
+#[tokio::test]
+async fn target_declares_blake3_and_length_verification_accurately() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = service().download_target().unwrap();
+    let bytes = expected_bytes(48);
+    for digest in [
+        Some(Digest {
+            algorithm: DigestAlgorithm::Blake3,
+            value: blake3::hash(&bytes).to_hex().to_string(),
+        }),
+        None,
+    ] {
+        let operation = if digest.is_some() {
+            "blake3-op"
+        } else {
+            "length-op"
+        };
+        let dest = dir.path().join(operation);
+        let request = intent(operation, &dest);
+        let mut identity = PatternSource::new(48).identity();
+        identity.digest = digest.clone();
+        let state = target.prepare(&request, &identity).await.unwrap();
+        let DownloadStatus::Ready { state, .. } = target
+            .initialize(&request, &identity, &state)
+            .await
+            .unwrap()
+        else {
+            panic!("ready");
+        };
+        let state = target
+            .write_chunk(&request, &identity, &state, 0, bytes.clone())
+            .await
+            .unwrap();
+        let state = target.verify(&request, &identity, &state).await.unwrap();
+        let DownloadStatus::Complete { receipt, state } =
+            target.publish(&request, &identity, &state).await.unwrap()
+        else {
+            panic!("complete");
+        };
+        let expected = digest.map_or(Verification::Length, |digest| Verification::Digest {
+            algorithm: digest.algorithm,
+            value: digest.value,
+        });
+        assert_eq!(receipt.verified, expected);
+        // 本地被同长度替换：可信摘要应拒绝；无摘要只声明长度、不得声称摘要一致。
+        std::fs::write(&dest, [0xFF; 48]).unwrap();
+        let result = target.probe(&request, &identity, &state).await;
+        if identity.digest.is_some() {
+            assert!(matches!(result, Err(error) if error.kind == ErrorKind::Checkpoint));
+        } else {
+            let DownloadStatus::Complete { receipt, .. } = result.unwrap() else {
+                panic!("complete");
+            };
+            assert_eq!(receipt.verified, Verification::Length);
+        }
+    }
+}
+
+#[tokio::test]
+async fn hardlink_publish_window_reconciles_without_remote_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("linked.bin");
+    let checkpoints = dir.path().join("cp");
+    let first = run(
+        100,
+        "linked-op",
+        &dest,
+        &checkpoints,
+        &StopToken::default(),
+        &|progress| {
+            if progress.persisted == progress.total {
+                std::fs::write(&dest, b"occupied").unwrap();
+            }
+        },
+    )
+    .await;
+    assert!(matches!(first, Err(error) if error.kind == ErrorKind::Conflict));
+    let part = staging(&dest);
+    std::fs::remove_file(&dest).unwrap();
+    // 模拟 no-clobber 硬链接已发布、旧暂存名称尚未删除的崩溃窗口。
+    std::fs::hard_link(&part, &dest).unwrap();
+    struct MetadataOnlySource {
+        inner: PatternSource,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    impl DownloadSource for MetadataOnlySource {
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+        fn identity(&self) -> BoxFuture<'_, waybill::download::RemoteIdentity> {
+            <PatternSource as DownloadSource>::identity(&self.inner)
+        }
+        fn read_range(&self, _: u64, _: usize) -> BoxFuture<'_, Vec<u8>> {
+            Box::pin(async move {
+                self.reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(Error::new(
+                    ErrorKind::Protocol,
+                    "published download must not read remotely",
+                ))
+            })
+        }
+    }
+    let source = MetadataOnlySource {
+        inner: PatternSource::new(100),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let target = service().download_target().unwrap();
+    let store = FileCheckpointStore::new(&checkpoints);
+    let receipt = engine(16, 2)
+        .run(
+            &source,
+            target.as_ref(),
+            &store,
+            DownloadOptions {
+                intent: intent("linked-op", &dest),
+                stop: &StopToken::default(),
+                progress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(source.reads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(receipt.object, dest.to_string_lossy());
+    assert!(matches!(receipt.verified, Verification::Digest { .. }));
+    assert_eq!(std::fs::read(&dest).unwrap(), expected_bytes(100));
+    assert!(
+        !part.exists(),
+        "reconciled staging hardlink must be cleaned up"
+    );
 }

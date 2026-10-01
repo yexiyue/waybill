@@ -35,6 +35,8 @@ pub struct Digest {
 /// 云端源的当前身份；revision 由 service 内部约定，核心只比较相等。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteIdentity {
+    /// 源 service 类型与实例，隔离不同账户、端点和根目录。
+    pub service: ServiceIdentity,
     /// 非敏感、稳定的对象引用（如 Drive 文件 ID）。
     pub reference: String,
     /// 版本证据；恢复与完成前必须与首次观测一致。
@@ -48,7 +50,11 @@ impl RemoteIdentity {
     /// 校验引用、版本与摘要形态。
     pub fn validate(&self) -> Result<()> {
         let bounded = |value: &str| !value.is_empty() && value.len() <= 256;
-        if !bounded(&self.reference) || !bounded(&self.revision) {
+        if !bounded(&self.service.instance)
+            || self.service.instance.chars().any(char::is_control)
+            || !bounded(&self.reference)
+            || !bounded(&self.revision)
+        {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "invalid remote identity",
@@ -371,7 +377,10 @@ impl DownloadEngine {
                         ));
                     }
                     Flow::Download(flow) => {
-                        if flow.intent != options.intent || flow.service != target.identity() {
+                        if flow.intent != options.intent
+                            || flow.service != target.identity()
+                            || flow.source.service != identity.service
+                        {
                             return Err(Error::new(
                                 ErrorKind::IdentityMismatch,
                                 "checkpoint binding",
@@ -383,11 +392,15 @@ impl DownloadEngine {
                                 "source identity changed",
                             ));
                         }
-                        if covered(&flow.persisted) > identity.size
+                        if flow.persisted.len() > INTERVAL_LIMIT
                             || flow
                                 .persisted
                                 .iter()
-                                .any(|interval| interval.start >= interval.end)
+                                .any(|i| i.start >= i.end || i.end > identity.size)
+                            || flow
+                                .persisted
+                                .windows(2)
+                                .any(|pair| pair[0].end >= pair[1].start)
                         {
                             return Err(Error::new(ErrorKind::Checkpoint, "invalid saved ledger"));
                         }
@@ -418,8 +431,8 @@ impl DownloadEngine {
                 validate_receipt(&receipt, &flow)?;
                 flow.driver = state;
                 flow.receipt = Some(receipt.clone());
-                report(&flow, 0, true, options.progress);
                 lease.save(&flow.checkpoint()).await?;
+                report(&flow, 0, true, options.progress);
                 return Ok(receipt);
             }
             DownloadStatus::NeedsReset(state) => {
@@ -558,9 +571,9 @@ impl DownloadEngine {
             }
         };
         validate_receipt(&receipt, &flow)?;
-        report(&flow, read, true, options.progress);
         flow.receipt = Some(receipt.clone());
         lease.save(&flow.checkpoint()).await?;
+        report(&flow, read, true, options.progress);
         Ok(receipt)
     }
     /// 消费者已提交业务记账后，以准确回执删除 checkpoint。

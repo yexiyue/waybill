@@ -10,6 +10,11 @@ pub struct Layout {
 }
 
 impl Layout {
+    #[cfg(test)]
+    pub(crate) fn for_test(state: PathBuf) -> Self {
+        Self { state }
+    }
+
     /// 发现平台目录；HOME 缺失属于不可恢复的环境错误。
     pub fn discover() -> Result<Self> {
         let dirs = directories::ProjectDirs::from("com", "yexiyue", "waybill")
@@ -20,6 +25,11 @@ impl Layout {
             .map(PathBuf::from)
             .unwrap_or_else(|| dirs.data_local_dir().join("state"));
         Ok(Self { state })
+    }
+
+    /// 非敏感盘配置，与凭证分开保存。
+    pub fn drive_config(&self) -> PathBuf {
+        self.state.join("drives.json")
     }
 
     /// 引擎 checkpoint 存储根，交给 FileCheckpointStore。

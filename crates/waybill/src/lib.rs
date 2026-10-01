@@ -11,6 +11,7 @@ pub mod budget;
 pub mod checkpoint;
 pub mod download;
 pub mod error;
+pub mod object;
 pub mod service;
 pub mod source;
 pub mod upload;

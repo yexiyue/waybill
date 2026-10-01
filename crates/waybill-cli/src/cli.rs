@@ -9,9 +9,12 @@ pub struct Cli {
     /// 输出机器可读的 JSON（每行一个事件或记录）。
     #[arg(long, global = true)]
     pub json: bool,
-    /// 显示行式上传进度，即使标准错误不是终端。
+    /// 显示行式传输进度，即使标准错误不是终端。
     #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+    /// 使用配置盘；缺省使用默认盘。
+    #[arg(long, global = true, value_name = "NAME")]
+    pub drive: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -34,35 +37,103 @@ pub enum Command {
         account: Option<String>,
     },
     /// 投递文件到云端；重跑同一命令即续传或按回执幂等跳过。
-    Put(PutArgs),
+    Put(PutInput),
     /// 从云端取回文件到本地；重跑同一命令即续传或按回执幂等跳过。
-    Get(GetArgs),
+    Get(GetInput),
     /// 列出云盘目录内容。
-    List(ListArgs),
+    List(ListInput),
     /// 列出本机恢复记录与已完成回执。
     Status,
+    /// 配置盘名称、账户和默认根目录。
+    Drive {
+        #[command(subcommand)]
+        command: DriveCommand,
+    },
+}
+
+#[derive(Args)]
+pub struct PutInput {
+    /// 本地文件；省略时多选。末尾完整 URI 仍可用作目标。
+    #[arg(value_name = "SRC")]
+    pub sources: Vec<PathBuf>,
+    /// 默认盘下的目标路径，目录以 / 结尾；省略时选择目录。
+    #[arg(long = "to", value_name = "PATH")]
+    pub dest: Option<String>,
+    #[command(flatten)]
+    pub transfer: TransferArgs,
+}
+#[derive(Args)]
+pub struct GetInput {
+    /// 默认盘下的文件路径或完整 URI；省略时云端多选。
+    pub source: Option<String>,
+    /// 本地文件或目录；省略时选择本地目录。
+    pub dest: Option<PathBuf>,
+    /// 本地目标；便于省略源路径时直接进入云端多选。
+    #[arg(long, conflicts_with = "dest")]
+    pub into: Option<PathBuf>,
+    #[command(flatten)]
+    pub transfer: TransferArgs,
+}
+#[derive(Args)]
+pub struct ListInput {
+    /// 默认盘下的目录路径或完整 URI；省略时浏览云盘。
+    pub path: Option<String>,
+    #[arg(long, value_name = "ID")]
+    pub root: Option<String>,
+    /// 禁用交互及全屏传输面板。
+    #[arg(long)]
+    pub no_tui: bool,
+}
+#[derive(Args)]
+pub struct TransferArgs {
+    /// 固定操作 ID，仅支持单个文件。
+    #[arg(long, value_name = "ID")]
+    pub operation: Option<String>,
+    /// 同名目标的处理策略。
+    #[arg(long, value_enum, default_value_t = Conflict::Reject)]
+    pub conflict: Conflict,
+    /// 临时覆盖盘配置中的根目录对象 ID。
+    #[arg(long, value_name = "ID")]
+    pub root: Option<String>,
+    /// 禁用交互及全屏传输面板。
+    #[arg(long)]
+    pub no_tui: bool,
+}
+#[derive(Subcommand)]
+pub enum DriveCommand {
+    /// 添加或更新盘；第一个盘自动成为默认盘。
+    Add {
+        name: String,
+        #[arg(long)]
+        account: String,
+        #[arg(long, default_value = "root")]
+        root: String,
+        #[arg(long)]
+        default: bool,
+    },
+    /// 设置默认盘。
+    Use { name: String },
+    /// 设置默认根目录；省略 ID 时进入云端目录选择器。
+    Root { name: String, id: Option<String> },
+    /// 删除盘配置，保留登录凭证与恢复记录。
+    Remove { name: String },
+    /// 显示已配置的盘。
+    List,
 }
 
 /// 文件投递参数；由 clap 校验后交给命令编排。
-#[derive(Args)]
 pub struct PutArgs {
     /// 本地源文件；允许多个。
-    #[arg(value_name = "SRC", required = true)]
     pub sources: Vec<PathBuf>,
     /// 目标 URI，如 gdrive://account@example.com/backup/
-    #[arg(value_name = "DEST-URI")]
     pub dest: String,
     /// 覆盖默认操作 ID（默认由实例、目标与内容摘要推导）。
-    #[arg(long, value_name = "ID")]
     pub operation: Option<String>,
     /// 同名目标冲突策略。
-    #[arg(long, value_enum, default_value_t = Conflict::Reject)]
     pub conflict: Conflict,
     /// Drive 根目录对象 ID；缺省为 root。
-    #[arg(long, value_name = "ID")]
     pub root: Option<String>,
     /// 禁用全屏面板，使用行式输出（非终端自动生效）。
-    #[arg(long)]
     pub no_tui: bool,
 }
 
@@ -74,36 +145,26 @@ pub enum Provider {
 }
 
 /// 文件取回参数；源为云盘路径，目标为本地文件或目录。
-#[derive(Args)]
 pub struct GetArgs {
     /// 源 URI，如 gdrive://account@example.com/backup/a.zip
-    #[arg(value_name = "SRC-URI")]
     pub source: String,
     /// 本地目标文件路径；为已存在目录时使用远端文件名。
-    #[arg(value_name = "DEST")]
     pub dest: PathBuf,
-    /// 覆盖默认操作 ID（默认由实例、源版本与目标推导）。
-    #[arg(long, value_name = "ID")]
+    /// 覆盖默认操作 ID（默认由源和目标实例、源版本与绝对路径推导）。
     pub operation: Option<String>,
     /// 同名本地目标冲突策略。
-    #[arg(long, value_enum, default_value_t = Conflict::Reject)]
     pub conflict: Conflict,
     /// Drive 根目录对象 ID；缺省为 root。
-    #[arg(long, value_name = "ID")]
     pub root: Option<String>,
     /// 禁用全屏面板，使用行式输出（非终端自动生效）。
-    #[arg(long)]
     pub no_tui: bool,
 }
 
 /// 目录列表参数。
-#[derive(Args)]
 pub struct ListArgs {
     /// 目录 URI，如 gdrive://account@example.com/backup/；根目录可省略路径。
-    #[arg(value_name = "DIR-URI")]
     pub uri: String,
     /// Drive 根目录对象 ID；缺省为 root。
-    #[arg(long, value_name = "ID")]
     pub root: Option<String>,
 }
 
@@ -127,6 +188,34 @@ impl From<Conflict> for waybill::upload::ConflictPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_commands_parse_for_interactive_completion() {
+        for command in ["list", "get", "put"] {
+            assert!(Cli::try_parse_from(["wb", command]).is_ok());
+        }
+        let cli =
+            Cli::try_parse_from(["wb", "--drive", "work", "put", "a", "b", "--to", "backup/"])
+                .unwrap();
+        assert_eq!(cli.drive.as_deref(), Some("work"));
+        let Command::Put(input) = cli.command else {
+            panic!("put");
+        };
+        assert_eq!(input.sources.len(), 2);
+        assert_eq!(input.dest.as_deref(), Some("backup/"));
+    }
+
+    #[test]
+    fn download_destination_can_be_given_without_a_source() {
+        let cli = Cli::try_parse_from(["wb", "get", "--into", "downloads"]).unwrap();
+        let Command::Get(input) = cli.command else {
+            panic!("get");
+        };
+        assert!(input.source.is_none());
+        assert_eq!(input.into, Some(PathBuf::from("downloads")));
+        assert!(Cli::try_parse_from(["wb", "get", "a", "b", "--into", "c"]).is_err());
+        assert!(Cli::try_parse_from(["wb", "drive", "root", "personal"]).is_ok());
+    }
 
     #[test]
     fn login_accepts_options_on_either_side_of_provider() {
@@ -166,9 +255,15 @@ mod tests {
         let Command::Put(args) = cli.command else {
             panic!("expected put");
         };
-        assert_eq!(args.sources, vec![PathBuf::from("a"), PathBuf::from("b")]);
-        assert_eq!(args.dest, "gdrive://bill/backup/");
-        assert!(args.no_tui);
+        assert_eq!(
+            args.sources,
+            vec![
+                PathBuf::from("a"),
+                PathBuf::from("b"),
+                PathBuf::from("gdrive://bill/backup/")
+            ]
+        );
+        assert!(args.transfer.no_tui);
     }
 
     #[test]
@@ -185,10 +280,10 @@ mod tests {
         let Command::Get(args) = cli.command else {
             panic!("expected get");
         };
-        assert_eq!(args.source, "gdrive://bill/backup/a.iso");
-        assert_eq!(args.dest, PathBuf::from("./a.iso"));
-        assert_eq!(args.conflict, Conflict::OperationSuffix);
-        assert_eq!(args.root, None);
+        assert_eq!(args.source.as_deref(), Some("gdrive://bill/backup/a.iso"));
+        assert_eq!(args.dest, Some(PathBuf::from("./a.iso")));
+        assert_eq!(args.transfer.conflict, Conflict::OperationSuffix);
+        assert_eq!(args.transfer.root, None);
     }
 
     #[test]
@@ -197,6 +292,6 @@ mod tests {
         let Command::List(args) = cli.command else {
             panic!("expected list");
         };
-        assert_eq!(args.uri, "gdrive://bill/backup/");
+        assert_eq!(args.path.as_deref(), Some("gdrive://bill/backup/"));
     }
 }
