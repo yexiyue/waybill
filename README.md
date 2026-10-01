@@ -111,6 +111,7 @@ sync, conflict merging, and multi-device synchronization are outside that scope.
 |---|---|
 | **M0** | Open contracts and versioned checkpoints |
 | **M1 — current** | Stable local sources, GDrive upload recovery, and independent consumer integration |
+| **CLI — in progress** | The `wb` command line (login / put / status): GDrive upload loop with a fullscreen dashboard and a `--json` event stream; downloads and MCP wait for M2+ |
 | **M2** | GDrive downloads, local staging, recovery and publication |
 | **M3** | WebDAV and a real-server compatibility matrix |
 | **M4** | OSS multipart recovery and completion reconciliation |

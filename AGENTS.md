@@ -14,7 +14,8 @@
 ## 当前仓库
 
 项目处于 **M1 GDrive 上传恢复原型阶段，未发布**。核心已提供公开上传契约，
-service-fs 提供稳定源和 checkpoint，service-gdrive 提供上传与对账。下载与本地发布
+service-fs 提供稳定源和 checkpoint，service-gdrive 提供上传与对账；`wb` CLI
+完成 login / put / status 的上传侧闭环（真机验收待补）。下载与本地发布
 后续实现；Operator / registry 等长期设计草图不是既有 API。
 
 | 路径 | 用途 |
@@ -23,15 +24,18 @@ service-fs 提供稳定源和 checkpoint，service-gdrive 提供上传与对账�
 | `crates/waybill/` | 公开契约与上传状态机 |
 | `crates/waybill-service-fs/` | 稳定本地源与持久 checkpoint |
 | `crates/waybill-service-gdrive/` | 原生 GDrive 上传协议与对账 |
+| `crates/waybill-cli/` | `wb` 命令行宿主：OAuth、凭证、多文件投递与面板 |
 | `examples/consumer/` | 独立公开 API 接入示例 |
 | `docs/DESIGN.zh-CN.md` | 架构、恢复语义、扩展契约与路线图 |
-| `docs/market-cli.zh-CN.md` | CLI 消费者的市场调研，尚无 CLI 实现 |
+| `docs/market-cli.zh-CN.md` | CLI 消费者的市场调研；实现见 `crates/waybill-cli/` |
 | `README.md` / `README.zh-CN.md` | 英文与中文项目入口 |
 | `assets/brand/` / `docs/BRAND.zh-CN.md` | Bill 吉祥物与品牌资产 |
 | `.github/workflows/ci.yml` | Linux 与 macOS 的 Rust CI |
 
-Rust edition 为 **2024**，声明的 MSRV 为 **1.85**，许可证为
-**MIT OR Apache-2.0**。新增依赖、语言特性和工具链配置须考虑这一版本约束。
+Rust edition 为 **2024**，库与 service 声明的 MSRV 为 **1.85**，许可证为
+**MIT OR Apache-2.0**。`waybill-cli` 是宿主工具，单独声明 MSRV **1.88**
+（ratatui-kit 0.10 精确锁定 ratatui 0.30.2，其依赖族要求 1.88）；
+CI 的 1.85 检查因此只覆盖库成员。新增依赖、语言特性和工具链配置须注意这一分界。
 
 ## 架构约束
 
@@ -94,7 +98,8 @@ cargo test --workspace
 ```
 
 需要格式化时使用 `cargo fmt --all`。现有 CI 在 Linux 与 macOS 上执行
-fmt、Clippy 和测试；它使用 stable 工具链并增加 Rust 1.85 检查，尚无浏览器验收任务。
+fmt、Clippy 和测试；它使用 stable 工具链，并以 Rust 1.85 检查库成员
+（CLI 的 ratatui 依赖链要求 1.88，由 stable 覆盖），尚无浏览器验收任务。
 不要把现有 CI 通过描述为所有 target、MSRV 或真实后端均已验证。
 
 真实后端验证需记录环境与能力，区分本地契约验证和服务端验收。
