@@ -10,6 +10,30 @@ use waybill::{
     upload::{ConflictPolicy, UploadIntent},
 };
 impl Gdrive {
+    /// 解析配置根目录为已验证的文件夹 ID；root 别名经 v2 about 取真实 ID。
+    pub(crate) async fn root_folder(&self) -> Result<String> {
+        if self.config.root == "root" {
+            return self.api.root_folder_id().await;
+        }
+        let root = self
+            .api
+            .get_file(&self.config.root)
+            .await?
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Drive root unavailable"))?;
+        if root.mime_type != "application/vnd.google-apps.folder" {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Drive root is not a folder",
+            ));
+        }
+        if root.id != self.config.root {
+            return Err(Error::new(
+                ErrorKind::IdentityMismatch,
+                "Drive root identity changed",
+            ));
+        }
+        Ok(root.id)
+    }
     pub(crate) async fn plan_target(&self, intent: &UploadIntent) -> Result<State> {
         intent.validate()?;
         let mut parts: Vec<&str> = intent.target.split('/').collect();
@@ -20,28 +44,7 @@ impl Gdrive {
                 "Drive directory depth bound",
             ));
         }
-        let mut parent = if self.config.root == "root" {
-            self.api.root_folder_id().await?
-        } else {
-            let root = self
-                .api
-                .get_file(&self.config.root)
-                .await?
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Drive root unavailable"))?;
-            if root.mime_type != "application/vnd.google-apps.folder" {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "Drive root is not a folder",
-                ));
-            }
-            if root.id != self.config.root {
-                return Err(Error::new(
-                    ErrorKind::IdentityMismatch,
-                    "Drive root identity changed",
-                ));
-            }
-            root.id
-        };
+        let mut parent = self.root_folder().await?;
         let mut directories = Vec::new();
         let mut parent_exists = true;
         for name in parts {

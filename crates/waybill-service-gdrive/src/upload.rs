@@ -23,6 +23,7 @@ impl UploadSink for Gdrive {
         Capabilities {
             offset_upload: true,
             durable_upload: true,
+            range_download: true,
             ..Capabilities::default()
         }
     }

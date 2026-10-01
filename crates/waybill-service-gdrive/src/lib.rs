@@ -1,6 +1,7 @@
-//! Google Drive 上传恢复 service；OAuth 授权和秘密存储属于宿主。
+//! Google Drive 上传恢复与下载 service；OAuth 授权和秘密存储属于宿主。
 //!
-//! 不支持下载、跨操作内容去重或通用原子发布。生产端点仅允许 Google HTTPS。
+//! 下载提供元数据复核与有界范围读取，不支持 Google 原生文档导出、
+//! 跨操作内容去重或通用原子发布。生产端点仅允许 Google HTTPS。
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #[cfg(target_arch = "wasm32")]
@@ -8,16 +9,21 @@ compile_error!("waybill-service-gdrive is a native-only prototype");
 mod client;
 pub mod credential;
 mod directory;
+mod download;
 mod object;
 mod upload;
 use client::DriveClient;
 use credential::TokenProvider;
 use std::sync::Arc;
 use waybill::{
+    BoxFuture,
+    download::{DownloadSource, DownloadTarget},
     error::{Error, ErrorKind, Result},
     service::{Service, ServiceId, ServiceIdentity, ServiceInfo},
     upload::UploadSink,
 };
+
+pub use download::{RemoteFile, Resolved};
 
 /// 不含秘密的实例配置；账户和 OAuth 应用身份由宿主稳定提供。
 #[derive(Clone)]
@@ -75,6 +81,18 @@ impl Service for Gdrive {
     }
     fn upload_sink(&self) -> Result<Arc<dyn UploadSink>> {
         Ok(Arc::new(self.clone()))
+    }
+    fn download_source<'a>(&'a self, reference: &'a str) -> BoxFuture<'a, Arc<dyn DownloadSource>> {
+        Box::pin(async move {
+            let media = self.media(reference)?;
+            Ok(Arc::new(media) as Arc<dyn DownloadSource>)
+        })
+    }
+    fn download_target(&self) -> Result<Arc<dyn DownloadTarget>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "download target unavailable",
+        ))
     }
 }
 #[cfg(test)]

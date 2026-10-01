@@ -8,7 +8,8 @@ use waybill::{
     source::SourceIdentity,
     upload::UploadIntent,
 };
-pub(crate) const FILE_FIELDS: &str = "id,name,size,parents,appProperties,trashed,mimeType";
+pub(crate) const FILE_FIELDS: &str =
+    "id,name,size,parents,appProperties,trashed,mimeType,md5Checksum,version,modifiedTime";
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DriveFile {
@@ -23,6 +24,14 @@ pub(crate) struct DriveFile {
     pub(crate) trashed: bool,
     #[serde(default)]
     pub(crate) mime_type: String,
+    /// 服务器计算的内容摘要；下载侧作为预期证据使用。
+    #[serde(default)]
+    pub(crate) md5_checksum: Option<String>,
+    /// 内容版本号；随内容变化递增。
+    #[serde(default)]
+    pub(crate) version: Option<String>,
+    #[serde(default)]
+    pub(crate) modified_time: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

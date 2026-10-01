@@ -60,6 +60,9 @@ struct Reply {
     headers: Vec<(&'static str, String)>,
     range: Option<String>,
     disconnect: bool,
+    raw: Option<Vec<u8>>,
+    expect_headers: Vec<(&'static str, String)>,
+    forbid_headers: Vec<&'static str>,
 }
 impl Reply {
     fn new(method: &'static str, path: &'static str, status: u16, body: serde_json::Value) -> Self {
@@ -71,7 +74,27 @@ impl Reply {
             headers: Vec::new(),
             range: None,
             disconnect: false,
+            raw: None,
+            expect_headers: Vec::new(),
+            forbid_headers: Vec::new(),
         }
+    }
+    /// 二进制响应体（媒体内容）；优先于 JSON body。
+    fn raw(method: &'static str, path: &'static str, status: u16, body: Vec<u8>) -> Self {
+        Self {
+            raw: Some(body),
+            ..Self::new(method, path, status, serde_json::Value::Null)
+        }
+    }
+    /// 断言请求携带指定头。
+    fn expect_header(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        self.expect_headers.push((key, value.into()));
+        self
+    }
+    /// 断言请求不携带指定头（如跨主机重定向后的 Authorization）。
+    fn forbid_header(mut self, key: &'static str) -> Self {
+        self.forbid_headers.push(key);
+        self
     }
     fn header(mut self, key: &'static str, value: impl Into<String>) -> Self {
         self.headers.push((key, value.into()));
@@ -145,11 +168,29 @@ impl Server {
                         "missing expected range"
                     );
                 }
+                for (key, value) in &reply.expect_headers {
+                    assert!(
+                        headers.to_ascii_lowercase().contains(&format!(
+                            "{}: {}",
+                            key,
+                            value.to_ascii_lowercase()
+                        )),
+                        "missing expected request header {key}"
+                    );
+                }
+                for key in &reply.forbid_headers {
+                    assert!(
+                        !headers.to_ascii_lowercase().contains(&format!("{key}:")),
+                        "unexpected request header {key}"
+                    );
+                }
                 if reply.disconnect {
                     drop(socket);
                     continue;
                 }
-                let body = if reply.body.is_null() {
+                let body = if let Some(raw) = reply.raw {
+                    raw
+                } else if reply.body.is_null() {
                     Vec::new()
                 } else {
                     serde_json::to_vec(&reply.body).unwrap()
@@ -1372,5 +1413,324 @@ async fn default_root_rejects_invalid_about_identity() {
         )]);
         assert!(drive.plan_target(&intent()).await.is_err());
     }
+    server.finished();
+}
+// ---------- 下载侧：范围读取、重定向白名单、元数据与路径解析 ----------
+
+/// 元数据响应；md5 / version 供下载身份复核。
+fn file_metadata(
+    id: &'static str,
+    name: &'static str,
+    size: &'static str,
+    md5: Option<&'static str>,
+) -> Reply {
+    let mut body = json!({
+        "id": id, "name": name, "size": size, "mimeType": "application/zip",
+        "trashed": false, "version": "3",
+    });
+    if let Some(md5) = md5 {
+        body["md5Checksum"] = json!(md5);
+    }
+    let path: &'static str = Box::leak(format!("/drive/v3/files/{id}").into_boxed_str());
+    Reply::new("GET", path, 200, body)
+}
+const MD5_16: &str = "0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn media_range_reads_validate_content_range_exactly() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![
+        Reply::raw("GET", "/drive/v3/files/file-1", 206, b"01234567".to_vec())
+            .header("Content-Range", "bytes 0-7/16")
+            .expect_header("range", "bytes=0-7"),
+    ]);
+    let data = drive
+        .media("file-1")
+        .unwrap()
+        .read_range(0, 8)
+        .await
+        .unwrap();
+    assert_eq!(data, b"01234567");
+    server.finished();
+}
+
+#[tokio::test]
+async fn media_range_rejects_partial_prefix_full_body() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    // 服务器忽略 Range 且响应超出请求长度：必须拒绝，不能静默截断。
+    server.add(vec![
+        Reply::raw("GET", "/drive/v3/files/file-1", 200, vec![0u8; 16])
+            .expect_header("range", "bytes=0-7"),
+    ]);
+    assert!(
+        matches!(drive.media("file-1").unwrap().read_range(0, 8).await, Err(e) if e.kind == ErrorKind::Protocol)
+    );
+    server.finished();
+}
+
+#[tokio::test]
+async fn media_full_file_ok_without_range_support() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![
+        Reply::raw("GET", "/drive/v3/files/file-1", 200, vec![7u8; 16])
+            .expect_header("range", "bytes=0-15"),
+    ]);
+    let data = drive
+        .media("file-1")
+        .unwrap()
+        .read_range(0, 16)
+        .await
+        .unwrap();
+    assert_eq!(data.len(), 16);
+    server.finished();
+}
+
+#[tokio::test]
+async fn media_range_errors_map_to_stable_kinds() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![Reply::raw(
+        "GET",
+        "/drive/v3/files/file-1",
+        416,
+        Vec::new(),
+    )]);
+    assert!(
+        matches!(drive.media("file-1").unwrap().read_range(0, 8).await, Err(e) if e.kind == ErrorKind::SourceChanged)
+    );
+    server.add(vec![Reply::raw(
+        "GET",
+        "/drive/v3/files/file-1",
+        404,
+        Vec::new(),
+    )]);
+    assert!(
+        matches!(drive.media("file-1").unwrap().read_range(0, 8).await, Err(e) if e.kind == ErrorKind::NotFound)
+    );
+    // 区间不匹配的 206 按协议错误处理。
+    server.add(vec![
+        Reply::raw("GET", "/drive/v3/files/file-1", 206, vec![0u8; 8])
+            .header("Content-Range", "bytes 4-11/16"),
+    ]);
+    assert!(
+        matches!(drive.media("file-1").unwrap().read_range(0, 8).await, Err(e) if e.kind == ErrorKind::Protocol)
+    );
+    server.finished();
+}
+
+#[tokio::test]
+async fn media_redirects_drop_credentials_cross_origin() {
+    let api = Server::new().await;
+    let cdn = Server::new().await;
+    let drive = drive(&api, Arc::new(Tokens::new()));
+    // 首跳 302 到内容服务器（测试豁免下仍要求同 scheme；跨源必须免鉴权）。
+    api.add(vec![
+        Reply::raw("GET", "/drive/v3/files/file-1", 302, Vec::new())
+            .header("Location", format!("{}/download/file-1", cdn.origin)),
+    ]);
+    cdn.add(vec![
+        Reply::raw("GET", "/download/file-1", 206, b"abcdefgh".to_vec())
+            .header("Content-Range", "bytes 0-7/16")
+            .forbid_header("authorization"),
+    ]);
+    let data = drive
+        .media("file-1")
+        .unwrap()
+        .read_range(0, 8)
+        .await
+        .unwrap();
+    assert_eq!(data, b"abcdefgh");
+    api.finished();
+    cdn.finished();
+}
+
+#[tokio::test]
+async fn media_redirect_targets_are_allowlisted() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    for location in [
+        "http://evil.example/f",
+        "https://user@evil.googleusercontent.com.evil.example/f",
+    ] {
+        server.add(vec![
+            Reply::raw("GET", "/drive/v3/files/file-1", 302, Vec::new())
+                .header("Location", location),
+        ]);
+        assert!(
+            matches!(drive.media("file-1").unwrap().read_range(0, 8).await, Err(e) if e.kind == ErrorKind::Protocol),
+            "重定向目标 {location} 必须被拒绝"
+        );
+    }
+    server.finished();
+}
+
+#[tokio::test]
+async fn download_identity_uses_version_md5_and_size() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![file_metadata("file-1", "a.zip", "16", Some(MD5_16))]);
+    let identity = drive.media("file-1").unwrap().identity().await.unwrap();
+    assert_eq!(identity.reference, "file-1");
+    assert_eq!(identity.size, 16);
+    assert_eq!(
+        identity.revision,
+        format!("3:{MD5_16}:16"),
+        "revision 复合 version / md5 / size"
+    );
+    assert_eq!(
+        identity
+            .digest
+            .as_ref()
+            .map(|d| (d.algorithm, d.value.as_str())),
+        Some((waybill::download::DigestAlgorithm::Md5, MD5_16))
+    );
+    server.finished();
+}
+
+#[tokio::test]
+async fn download_identity_rejects_native_documents_and_missing_files() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    // Google 原生文档没有二进制内容：明确拒绝而不是退化为导出。
+    server.add(vec![Reply::new(
+        "GET",
+        "/drive/v3/files/doc-1",
+        200,
+        json!({"id":"doc-1","name":"Doc","mimeType":"application/vnd.google-apps.document","trashed":false}),
+    )]);
+    assert!(
+        matches!(drive.media("doc-1").unwrap().identity().await, Err(e) if e.kind == ErrorKind::InvalidInput)
+    );
+    server.add(vec![missing()]);
+    assert!(
+        matches!(drive.media("object-1").unwrap().identity().await, Err(e) if e.kind == ErrorKind::NotFound)
+    );
+    // 回收站对象按不可用处理。
+    server.add(vec![Reply::new(
+        "GET",
+        "/drive/v3/files/file-2",
+        200,
+        json!({"id":"file-2","name":"a","size":"4","mimeType":"application/zip","trashed":true}),
+    )]);
+    assert!(
+        matches!(drive.media("file-2").unwrap().identity().await, Err(e) if e.kind == ErrorKind::NotFound)
+    );
+    server.finished();
+}
+
+/// 根目录解析 + 单层路径命中的标准前置响应。
+fn resolved_path() -> Vec<Reply> {
+    vec![
+        Reply::new(
+            "GET",
+            "/drive/v2/about",
+            200,
+            json!({"rootFolderId":"folder-1"}),
+        ),
+        Reply::new(
+            "GET",
+            "/drive/v3/files?",
+            200,
+            json!({"files":[{"id":"dir-1","name":"backup","mimeType":"application/vnd.google-apps.folder","trashed":false}]}),
+        ),
+        Reply::new(
+            "GET",
+            "/drive/v3/files?",
+            200,
+            json!({"files":[{"id":"file-1","name":"a.zip","size":"16","mimeType":"application/zip","trashed":false,"version":"3","md5Checksum":MD5_16}]}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn resolve_walks_segments_from_configured_root() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(resolved_path());
+    let resolved = drive.resolve("backup/a.zip").await.unwrap();
+    let Resolved::File(file) = resolved else {
+        panic!("expected file");
+    };
+    assert_eq!(file.id, "file-1");
+    assert_eq!(file.size, Some(16));
+    assert!(!file.folder);
+    // 根路径解析为根文件夹本身。
+    server.add(vec![Reply::new(
+        "GET",
+        "/drive/v2/about",
+        200,
+        json!({"rootFolderId":"folder-1"}),
+    )]);
+    let Resolved::Folder { id } = drive.resolve("/").await.unwrap() else {
+        panic!("expected folder");
+    };
+    assert_eq!(id, "folder-1");
+    server.finished();
+}
+
+#[tokio::test]
+async fn resolve_rejects_ambiguity_and_reports_missing_paths() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![
+        Reply::new(
+            "GET",
+            "/drive/v2/about",
+            200,
+            json!({"rootFolderId":"folder-1"}),
+        ),
+        Reply::new(
+            "GET",
+            "/drive/v3/files?",
+            200,
+            json!({"files":[
+                {"id":"a-1","name":"backup","mimeType":"application/vnd.google-apps.folder","trashed":false},
+                {"id":"a-2","name":"backup","mimeType":"application/vnd.google-apps.folder","trashed":false}
+            ]}),
+        ),
+    ]);
+    assert!(
+        matches!(drive.resolve("backup/a.zip").await, Err(e) if e.kind == ErrorKind::InvalidInput),
+        "同名目录必须报多义错误"
+    );
+    server.add(vec![
+        Reply::new(
+            "GET",
+            "/drive/v2/about",
+            200,
+            json!({"rootFolderId":"folder-1"}),
+        ),
+        listing(),
+    ]);
+    assert!(matches!(drive.resolve("absent.bin").await, Err(e) if e.kind == ErrorKind::NotFound));
+    server.finished();
+}
+
+#[tokio::test]
+async fn list_folder_maps_children_with_folder_flags() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![Reply::new(
+        "GET",
+        "/drive/v3/files?",
+        200,
+        json!({"files":[
+            {"id":"d-1","name":"sub","mimeType":"application/vnd.google-apps.folder","trashed":false},
+            {"id":"f-1","name":"a.zip","size":"16","mimeType":"application/zip","trashed":false,"modifiedTime":"2026-10-01T00:00:00Z"},
+            {"id":"f-2","name":"doc","mimeType":"application/vnd.google-apps.document","trashed":false}
+        ]}),
+    )]);
+    let children = drive.list("folder-1").await.unwrap();
+    assert_eq!(children.len(), 3);
+    assert!(children[0].folder);
+    assert!(children[1].size.is_some());
+    assert_eq!(
+        children[1].modified_time.as_deref(),
+        Some("2026-10-01T00:00:00Z")
+    );
+    assert!(children[2].size.is_none(), "原生文档无字节长度");
     server.finished();
 }

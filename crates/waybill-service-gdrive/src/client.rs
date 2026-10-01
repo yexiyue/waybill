@@ -8,6 +8,8 @@ use serde::de::DeserializeOwned;
 use std::{sync::Arc, time::Duration};
 use waybill::error::{Error, ErrorKind, Result};
 const METADATA_LIMIT: usize = 1024 * 1024;
+/// 列表与元数据共用的字段集；下载侧需要 md5 / version / modifiedTime。
+pub(crate) const LIST_FIELDS: &str = "nextPageToken,files(id,name,size,parents,appProperties,trashed,mimeType,md5Checksum,version,modifiedTime)";
 pub(crate) struct DriveClient {
     pub(crate) http: reqwest::Client,
     credentials: Arc<dyn TokenProvider>,
@@ -58,29 +60,47 @@ impl DriveClient {
         request: reqwest::RequestBuilder,
         idempotent: bool,
     ) -> Result<Response> {
-        let mut token = self
-            .credentials
-            .access_token(Duration::from_secs(90))
-            .await?;
+        self.dispatch(request, idempotent, true).await
+    }
+    /// `authorized = false` 供跨主机媒体 URL 使用：不获取也不携带凭证。
+    pub(crate) async fn dispatch(
+        &self,
+        request: reqwest::RequestBuilder,
+        idempotent: bool,
+        authorized: bool,
+    ) -> Result<Response> {
+        let mut token = if authorized {
+            Some(
+                self.credentials
+                    .access_token(Duration::from_secs(90))
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut refreshed = false;
         let mut attempt = 0;
         loop {
-            let response = request
-                .try_clone()
-                .ok_or_else(protocol)?
-                .bearer_auth(token.secret())
-                .send()
-                .await;
+            let mut builder = request.try_clone().ok_or_else(protocol)?;
+            if let Some(token) = &token {
+                builder = builder.bearer_auth(token.secret());
+            }
+            let response = builder.send().await;
             match response {
                 Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    if !authorized {
+                        // 签名媒体 URL 拒绝通常意味着过期；重新解析即可恢复。
+                        return Err(Error::new(ErrorKind::Retryable, "Drive media URL rejected"));
+                    }
+                    let current = token.as_ref().ok_or_else(protocol)?;
                     if refreshed {
-                        self.credentials.reconnect_required(&token).await?;
+                        self.credentials.reconnect_required(current).await?;
                         return Err(Error::new(
                             ErrorKind::Authentication,
                             "Drive authorization rejected",
                         ));
                     }
-                    token = self.credentials.after_rejection(&token).await?;
+                    token = Some(self.credentials.after_rejection(current).await?);
                     refreshed = true;
                 }
                 Ok(response)
@@ -188,7 +208,17 @@ impl DriveClient {
         let mut files = Vec::new();
         let mut page = String::new();
         loop {
-            let response = self.request(self.http.get(format!("{}/files", self.api_root)).query(&[("q", query), ("fields", "nextPageToken,files(id,name,size,parents,appProperties,trashed,mimeType)"), ("pageSize", "100"), ("pageToken", &page)]), true).await?;
+            let response = self
+                .request(
+                    self.http.get(format!("{}/files", self.api_root)).query(&[
+                        ("q", query),
+                        ("fields", LIST_FIELDS),
+                        ("pageSize", "100"),
+                        ("pageToken", &page),
+                    ]),
+                    true,
+                )
+                .await?;
             ensure_success(&response)?;
             let result: FileList = read_json(response).await?;
             if files.len() + result.files.len() > 1000 {
@@ -203,6 +233,112 @@ impl DriveClient {
                 None => return Ok(files),
             }
         }
+    }
+    /// 有界范围读取媒体内容。媒体 URL 常以 302 指向内容 CDN：
+    /// 手动跟随白名单内的 Google 域名，跨主机跳转不携带凭证，
+    /// 与会话 URL 校验同一风格且不依赖 reqwest 的重定向策略。
+    pub(crate) async fn read_media_range(
+        &self,
+        id: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        validate_id(id)?;
+        if length == 0 || length > 8 * 1024 * 1024 {
+            return Err(Error::new(ErrorKind::InvalidInput, "media range bound"));
+        }
+        let end = offset
+            .checked_add(length as u64)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "media range bound"))?;
+        let mut url = format!("{}/files/{id}?alt=media", self.api_root);
+        let mut authorized = true;
+        let mut redirects = 0;
+        loop {
+            let response = self
+                .dispatch(
+                    self.http
+                        .get(&url)
+                        .header("Range", format!("bytes={offset}-{end}")),
+                    true,
+                    authorized,
+                )
+                .await?;
+            let status = response.status().as_u16();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                redirects += 1;
+                if redirects > 5 {
+                    return Err(protocol());
+                }
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(protocol)?;
+                let (next, same_host) = self.media_target(location)?;
+                url = next;
+                authorized = same_host;
+                continue;
+            }
+            match status {
+                206 => {
+                    let header = response
+                        .headers()
+                        .get("content-range")
+                        .and_then(|value| value.to_str().ok())
+                        .ok_or_else(protocol)?;
+                    if !header.starts_with(&format!("bytes {offset}-{end}/")) {
+                        return Err(protocol());
+                    }
+                    return read_media_body(response, length).await;
+                }
+                200 => {
+                    // 服务器忽略 Range；仅当请求覆盖整个文件时才可接受，
+                    // 超出请求长度的响应按协议错误拒绝，不静默丢弃数据。
+                    if offset != 0 {
+                        return Err(protocol());
+                    }
+                    return read_media_body(response, length).await;
+                }
+                404 => {
+                    return Err(Error::new(ErrorKind::NotFound, "Drive media unavailable"));
+                }
+                416 => {
+                    return Err(Error::new(
+                        ErrorKind::SourceChanged,
+                        "media range beyond object",
+                    ));
+                }
+                _ => {
+                    ensure_success(&response)?;
+                    return Err(protocol());
+                }
+            }
+        }
+    }
+    /// 校验重定向目标并返回是否与 API 同源（同源保留凭证）。
+    fn media_target(&self, location: &str) -> Result<(String, bool)> {
+        let url = url::Url::parse(location).map_err(|_| protocol())?;
+        let Some(host) = url.host_str() else {
+            return Err(protocol());
+        };
+        let production = url.scheme() == "https"
+            && url.port_or_known_default() == Some(443)
+            && (host == "www.googleapis.com"
+                || host == "drive.google.com"
+                || host.ends_with(".googleusercontent.com"));
+        #[cfg(test)]
+        let production = production
+            || self
+                .test_origin
+                .as_ref()
+                .is_some_and(|base| base.host_str() == Some(host) && base.scheme() == url.scheme());
+        if !production || !url.username().is_empty() || url.password().is_some() {
+            return Err(protocol());
+        }
+        let same_origin =
+            url::Url::parse(&self.api_root).is_ok_and(|base| base.origin() == url.origin());
+        Ok((url.to_string(), same_origin))
     }
     pub(crate) async fn generate_id(&self) -> Result<String> {
         let response = self
@@ -241,6 +377,23 @@ pub(crate) async fn read_json<T: DeserializeOwned>(mut response: Response) -> Re
         data.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&data).map_err(|_| protocol())
+}
+pub(crate) async fn read_media_body(mut response: Response, length: usize) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(length);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Error::new(ErrorKind::Retryable, "Drive response transport"))?
+    {
+        if chunk.len() > length - data.len() {
+            return Err(protocol());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.len() != length {
+        return Err(protocol());
+    }
+    Ok(data)
 }
 pub(crate) fn ensure_success(response: &Response) -> Result<()> {
     if response.status().is_success() {
