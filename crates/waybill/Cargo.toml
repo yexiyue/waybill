@@ -12,3 +12,9 @@ categories = ["asynchronous", "filesystem"]
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+# 测试运行时与 v1 兼容记录构造；不进入核心生产依赖树。
+tokio.workspace = true
+serde_json.workspace = true

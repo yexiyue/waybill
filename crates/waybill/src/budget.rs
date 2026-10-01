@@ -45,6 +45,10 @@ impl ResourceBudget {
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
+    /// 共享并发上界；下载引擎据此限制在途请求数。
+    pub fn concurrency_limit(&self) -> usize {
+        self.concurrency
+    }
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {

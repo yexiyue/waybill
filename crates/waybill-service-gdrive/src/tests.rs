@@ -17,7 +17,7 @@ use tokio::{
 use waybill::{
     BoxFuture,
     budget::ResourceBudget,
-    checkpoint::{Checkpoint, CheckpointLease, CheckpointStore},
+    checkpoint::{Checkpoint, CheckpointLease, CheckpointStore, Flow},
     error::{Error, ErrorKind},
     source::Source,
     upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent, UploadPolicy},
@@ -315,7 +315,10 @@ async fn pause_restart_reconciles_server_ahead_and_retains_receipt_until_confirm
     // 模拟本地确认记录落后：服务器已接收比 checkpoint 更多的字节。
     let lease = store.acquire("operation-1").await.unwrap();
     let mut saved = lease.load().await.unwrap().unwrap();
-    saved.acknowledged = 0;
+    let Flow::Upload(flow) = &mut saved.flow else {
+        panic!("upload flow");
+    };
+    flow.acknowledged = 0;
     lease.save(&saved).await.unwrap();
     drop(lease);
     server.add(vec![
@@ -355,7 +358,14 @@ async fn pause_restart_reconciles_server_ahead_and_retains_receipt_until_confirm
         .unwrap();
     let lease = store.acquire("operation-1").await.unwrap();
     assert_eq!(
-        lease.load().await.unwrap().unwrap().receipt,
+        lease
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .upload()
+            .unwrap()
+            .receipt,
         Some(receipt.clone())
     );
     drop(lease);
@@ -696,7 +706,9 @@ impl CheckpointLease for FailingLease {
     }
     fn save<'a>(&'a self, checkpoint: &'a Checkpoint) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if checkpoint.receipt.is_some()
+            if checkpoint
+                .upload()
+                .is_some_and(|flow| flow.receipt.is_some())
                 && self
                     .fail_receipt
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -814,7 +826,10 @@ async fn changed_source_and_driver_version_preserve_recovery_record() {
         .await;
     let lease = store.acquire("operation-1").await.unwrap();
     let mut saved = lease.load().await.unwrap().unwrap();
-    saved.driver.version = 999;
+    let Flow::Upload(flow) = &mut saved.flow else {
+        panic!("upload flow");
+    };
+    flow.driver.version = 999;
     lease.save(&saved).await.unwrap();
     drop(lease);
     assert!(
@@ -931,6 +946,8 @@ async fn expired_session_restart_count_is_bounded() {
             .await
             .unwrap()
             .unwrap()
+            .upload()
+            .unwrap()
             .restarts,
         2
     );
@@ -1032,6 +1049,8 @@ async fn a_new_process_resumes_the_persisted_checkpoint() {
             .load()
             .await
             .unwrap()
+            .unwrap()
+            .upload()
             .unwrap()
             .receipt
             .is_some()
@@ -1255,6 +1274,8 @@ async fn a_stop_during_source_read_prevents_scheduling_another_request() {
             .load()
             .await
             .unwrap()
+            .unwrap()
+            .upload()
             .unwrap()
             .acknowledged,
         0

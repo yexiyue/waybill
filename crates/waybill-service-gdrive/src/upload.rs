@@ -9,6 +9,7 @@ use serde_json::json;
 use waybill::{
     BoxFuture,
     checkpoint::DriverState,
+    download::{DigestAlgorithm, Verification},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
     source::SourceIdentity,
@@ -190,6 +191,10 @@ impl Gdrive {
                 target: intent.target.clone(),
                 object: file.id,
                 size: source.size,
+                verified: Verification::Digest {
+                    algorithm: DigestAlgorithm::Blake3,
+                    value: source.blake3.clone(),
+                },
             },
         })
     }

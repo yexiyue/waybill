@@ -309,6 +309,7 @@ mod tests {
                         target: intent.target.clone(),
                         object: "original-object".into(),
                         size: source.size,
+                        verified: Default::default(),
                     },
                 })
             })

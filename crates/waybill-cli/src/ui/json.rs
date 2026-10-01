@@ -120,6 +120,7 @@ mod tests {
             target: "backup/a.iso".into(),
             object: "obj-1".into(),
             size: 42,
+            verified: Default::default(),
         };
         let value = encode(Event::Completed { index: 0, receipt });
         assert_eq!(value["type"], "completed");

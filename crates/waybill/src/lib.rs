@@ -1,6 +1,7 @@
-//! 可恢复交付的开放契约与上传状态机。
+//! 可恢复交付的开放契约与上传、下载状态机。
 //!
-//! 首期仅提供稳定 Source 到 UploadSink 的上传。下载与本地发布尚未实现。
+//! 上传提供稳定 Source 到 UploadSink 的契约；下载提供云端
+//! DownloadSource 到本地 DownloadTarget 的区间账本与发布契约。
 //! service 拥有协议和 IO，宿主拥有授权、源文件冻结与业务记账。
 //! 完成回执持久化后才能成功返回；会话过期默认保留记录并暂停。
 #![forbid(unsafe_code)]
@@ -8,6 +9,7 @@
 
 pub mod budget;
 pub mod checkpoint;
+pub mod download;
 pub mod error;
 pub mod service;
 pub mod source;

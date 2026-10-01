@@ -5,7 +5,7 @@
 use crate::{error::CliError, paths::Layout, ui::human_bytes};
 use serde::Serialize;
 use std::{io::Read, path::Path};
-use waybill::checkpoint::{Checkpoint, FORMAT_VERSION};
+use waybill::checkpoint::{Checkpoint, Flow};
 
 // 与 FileCheckpointStore 的记录大小上限一致，避免损坏文件导致无界读取。
 const CHECKPOINT_LIMIT: usize = 1024 * 1024;
@@ -15,13 +15,16 @@ const RECORD_LIMIT: usize = 1000;
 #[derive(Serialize)]
 struct SessionRow {
     operation: String,
+    /// upload = 上传；download = 下载。
+    direction: &'static str,
     target: String,
     service: String,
     instance: String,
+    /// 上传为服务端确认偏移；下载为已持久化区间和。
     acknowledged: u64,
     total: u64,
     restarts: u32,
-    /// in_flight = 上传未完成；completed = 已完成，保留回执用于重复投递对账。
+    /// in_flight = 传输未完成；completed = 已完成，保留回执用于重复投递对账。
     state: &'static str,
 }
 
@@ -81,21 +84,10 @@ fn scan(dir: &Path) -> Result<(Vec<SessionRow>, Vec<Unreadable>), CliError> {
             });
             continue;
         };
-        match serde_json::from_slice::<Checkpoint>(&bytes) {
-            Ok(checkpoint) if checkpoint.version == FORMAT_VERSION => rows.push(SessionRow {
-                operation: checkpoint.intent.operation,
-                target: checkpoint.intent.target,
-                service: checkpoint.service.service.as_str().to_string(),
-                instance: checkpoint.service.instance,
-                acknowledged: checkpoint.acknowledged,
-                total: checkpoint.source.size,
-                restarts: checkpoint.restarts,
-                state: if checkpoint.receipt.is_some() {
-                    "completed"
-                } else {
-                    "in_flight"
-                },
-            }),
+        match waybill_service_fs::decode_checkpoint(&bytes) {
+            Ok(checkpoint) if Checkpoint::supported(checkpoint.version, &checkpoint.flow) => {
+                rows.push(row(&checkpoint))
+            }
             Ok(_) => unreadable.push(Unreadable {
                 file,
                 reason: "incompatible version",
@@ -108,6 +100,46 @@ fn scan(dir: &Path) -> Result<(Vec<SessionRow>, Vec<Unreadable>), CliError> {
     }
     rows.sort_by(|a, b| a.operation.cmp(&b.operation));
     Ok((rows, unreadable))
+}
+
+/// 只读取公共信封字段；下载行 acknowledged 汇总区间账本。
+fn row(checkpoint: &Checkpoint) -> SessionRow {
+    match &checkpoint.flow {
+        Flow::Upload(flow) => SessionRow {
+            operation: flow.intent.operation.clone(),
+            direction: "upload",
+            target: flow.intent.target.clone(),
+            service: flow.service.service.as_str().to_string(),
+            instance: flow.service.instance.clone(),
+            acknowledged: flow.acknowledged,
+            total: flow.source.size,
+            restarts: flow.restarts,
+            state: if flow.receipt.is_some() {
+                "completed"
+            } else {
+                "in_flight"
+            },
+        },
+        Flow::Download(flow) => SessionRow {
+            operation: flow.intent.operation.clone(),
+            direction: "download",
+            target: flow.intent.target.clone(),
+            service: flow.service.service.as_str().to_string(),
+            instance: flow.service.instance.clone(),
+            acknowledged: flow
+                .persisted
+                .iter()
+                .map(|interval| interval.end - interval.start)
+                .sum(),
+            total: flow.source.size,
+            restarts: 0,
+            state: if flow.receipt.is_some() {
+                "completed"
+            } else {
+                "in_flight"
+            },
+        },
+    }
 }
 
 fn read_checkpoint(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -132,11 +164,16 @@ fn render(dir: &Path, rows: &[SessionRow]) {
         } else {
             "在途"
         };
+        let direction = if row.direction == "download" {
+            "下载"
+        } else {
+            "上传"
+        };
         let operation: String = row.operation.chars().take(16).collect();
         let acknowledged = human_bytes(row.acknowledged);
         let total = human_bytes(row.total);
         println!(
-            "{operation:<16} {target:<32} {acknowledged:>12} / {total:<12} {percent:>3}%  restarts={restarts}  {state}",
+            "{operation:<16} {direction:<4} {target:<32} {acknowledged:>12} / {total:<12} {percent:>3}%  restarts={restarts}  {state}",
             target = row.target,
             restarts = row.restarts,
             state = state,
@@ -149,15 +186,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use waybill::{
-        checkpoint::{Checkpoint, DriverState},
+        checkpoint::{Checkpoint, DownloadFlow, DriverState, UploadFlow},
+        download::{Digest, DigestAlgorithm, DownloadIntent, Interval, RemoteIdentity},
         service::{ServiceId, ServiceIdentity},
         source::SourceIdentity,
-        upload::{ConflictPolicy, UploadIntent},
+        upload::{ConflictPolicy, Receipt, UploadIntent},
     };
 
-    fn checkpoint(operation: &str, acknowledged: u64, with_receipt: bool) -> Checkpoint {
-        Checkpoint {
-            version: FORMAT_VERSION,
+    fn upload_checkpoint(operation: &str, acknowledged: u64, with_receipt: bool) -> Checkpoint {
+        UploadFlow {
             intent: UploadIntent {
                 operation: operation.into(),
                 target: "backup/a.iso".into(),
@@ -179,7 +216,7 @@ mod tests {
                 version: 1,
                 payload: b"session".to_vec(),
             },
-            receipt: with_receipt.then(|| waybill::upload::Receipt {
+            receipt: with_receipt.then(|| Receipt {
                 operation: operation.into(),
                 service: ServiceIdentity {
                     service: ServiceId::parse("waybill:gdrive").unwrap(),
@@ -188,8 +225,43 @@ mod tests {
                 target: "backup/a.iso".into(),
                 object: "obj-1".into(),
                 size: 16 * 1024 * 1024,
+                verified: Default::default(),
             }),
         }
+        .checkpoint()
+    }
+
+    fn download_checkpoint(operation: &str) -> Checkpoint {
+        DownloadFlow {
+            intent: DownloadIntent {
+                operation: operation.into(),
+                target: "/tmp/restore/a.iso".into(),
+                conflict: ConflictPolicy::Reject,
+            },
+            service: ServiceIdentity {
+                service: ServiceId::parse("waybill:fs").unwrap(),
+                instance: "local".into(),
+            },
+            source: RemoteIdentity {
+                reference: "drive-file-1".into(),
+                revision: "3:abc:16".into(),
+                size: 16 * 1024 * 1024,
+                digest: Some(Digest {
+                    algorithm: DigestAlgorithm::Md5,
+                    value: "0".repeat(32),
+                }),
+            },
+            persisted: vec![Interval {
+                start: 0,
+                end: 8 * 1024 * 1024,
+            }],
+            driver: DriverState {
+                version: 1,
+                payload: b"part".to_vec(),
+            },
+            receipt: None,
+        }
+        .checkpoint()
     }
 
     #[test]
@@ -198,24 +270,52 @@ mod tests {
         let root: PathBuf = dir.path().into();
         std::fs::write(
             root.join("aaa.json"),
-            serde_json::to_vec(&checkpoint("op-aaa", 8 * 1024 * 1024, false)).unwrap(),
+            serde_json::to_vec(&upload_checkpoint("op-aaa", 8 * 1024 * 1024, false)).unwrap(),
         )
         .unwrap();
         std::fs::write(
             root.join("bbb.json"),
-            serde_json::to_vec(&checkpoint("op-bbb", 16 * 1024 * 1024, true)).unwrap(),
+            serde_json::to_vec(&upload_checkpoint("op-bbb", 16 * 1024 * 1024, true)).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("ccc.json"),
+            serde_json::to_vec(&download_checkpoint("op-ccc")).unwrap(),
         )
         .unwrap();
         std::fs::write(root.join("bbb.lock"), b"").unwrap();
         std::fs::write(root.join("broken.json"), b"{").unwrap();
 
         let (rows, unreadable) = scan(&root).unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].operation, "op-aaa");
         assert_eq!(rows[0].state, "in_flight");
         assert_eq!(rows[1].state, "completed");
+        assert_eq!(rows[2].direction, "download");
+        assert_eq!(rows[2].acknowledged, 8 * 1024 * 1024);
         assert_eq!(unreadable.len(), 1);
         assert_eq!(unreadable[0].reason, "decode failed");
+    }
+
+    /// v1 平铺上传记录（M1 保存格式）必须继续可读。
+    #[test]
+    fn scan_still_reads_v1_flat_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = format!(
+            "{{\"version\":1,\"intent\":{{\"operation\":\"legacy\",\"target\":\"a.bin\",\
+             \"conflict\":\"Reject\"}},\"service\":{{\"service\":\"waybill:gdrive\",\
+             \"instance\":\"inst\"}},\"source\":{{\"reference\":\"/tmp/a\",\
+             \"revision\":\"r\",\"size\":10,\"blake3\":\"{}\"}},\"acknowledged\":4,\
+             \"restarts\":0,\"driver\":{{\"version\":1,\"payload\":[]}},\"receipt\":null}}",
+            "0".repeat(64)
+        );
+        std::fs::write(dir.path().join("legacy.json"), v1).unwrap();
+        let (rows, unreadable) = scan(dir.path()).unwrap();
+        assert!(unreadable.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].operation, "legacy");
+        assert_eq!(rows[0].direction, "upload");
+        assert_eq!(rows[0].acknowledged, 4);
     }
 
     #[test]

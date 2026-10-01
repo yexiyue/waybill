@@ -16,6 +16,8 @@ waybill-service-gdrive = { path = "crates/waybill-service-gdrive" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# 引擎内并发调度的执行器无关工具；不是执行器，核心仍不绑定运行时。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1.49", features = ["fs", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros", "net", "signal"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
 blake3 = "=1.8.2"

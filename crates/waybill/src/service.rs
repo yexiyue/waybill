@@ -1,6 +1,7 @@
 //! 开放 service 标识与按实例声明的能力。
 use crate::{
     BoxFuture,
+    download::{DownloadSource, DownloadTarget},
     error::{Error, ErrorKind, Result},
     source::Source,
     upload::UploadSink,
@@ -66,6 +67,12 @@ pub struct Capabilities {
     pub offset_upload: bool,
     /// 支持服务端会话对账与跨进程恢复。
     pub durable_upload: bool,
+    /// 云端源支持精确范围读取。
+    pub range_download: bool,
+    /// 本地目标支持精确偏移随机写并逐块同步。
+    pub random_write: bool,
+    /// 本地目标支持同盘原子发布。
+    pub durable_publish: bool,
 }
 /// service 元信息。
 #[derive(Debug, Clone)]
@@ -75,7 +82,7 @@ pub struct ServiceInfo {
     /// 已实现能力。
     pub capabilities: Capabilities,
 }
-/// 外部 crate 可直接实现；读取与上传入口独立且默认明确拒绝。
+/// 外部 crate 可直接实现；读取与写入入口独立且默认明确拒绝。
 pub trait Service: Send + Sync {
     /// 返回实例能力。
     fn info(&self) -> ServiceInfo;
@@ -86,5 +93,24 @@ pub trait Service: Send + Sync {
     /// 获取上传契约；最小只读 service 无需实现。
     fn upload_sink(&self) -> Result<Arc<dyn UploadSink>> {
         Err(Error::new(ErrorKind::Unsupported, "upload unavailable"))
+    }
+    /// 以 service 自己解释的对象引用打开下载源。
+    fn download_source<'a>(
+        &'a self,
+        _reference: &'a str,
+    ) -> BoxFuture<'a, Arc<dyn DownloadSource>> {
+        Box::pin(async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "download source unavailable",
+            ))
+        })
+    }
+    /// 获取本地下载目标；云端 service 无需实现。
+    fn download_target(&self) -> Result<Arc<dyn DownloadTarget>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "download target unavailable",
+        ))
     }
 }

@@ -83,9 +83,7 @@ impl CheckpointLease for Lease {
             if data.len() > LIMIT {
                 return Err(Error::new(ErrorKind::Checkpoint, "checkpoint too large"));
             }
-            serde_json::from_slice(&data).map(Some).map_err(|e| {
-                Error::new(ErrorKind::Checkpoint, "invalid checkpoint JSON").with_source(e)
-            })
+            decode_checkpoint(&data).map(Some)
         }))
     }
     fn save<'a>(&'a self, checkpoint: &'a Checkpoint) -> BoxFuture<'a, ()> {
@@ -135,6 +133,32 @@ impl CheckpointLease for Lease {
             )
         }))
     }
+}
+/// 解码 checkpoint 记录；v1 平铺上传记录（无 `flow` 对象）在此包一层
+/// 上传流后按 v2 解码，M1 记录无需迁移即可恢复，下次保存时升级。
+/// 损坏与未知结构统一映射为 Checkpoint 错误，记录本身不被删除。
+pub fn decode_checkpoint(bytes: &[u8]) -> Result<Checkpoint> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| Error::new(ErrorKind::Checkpoint, "invalid checkpoint JSON").with_source(e))?;
+    let wrapped = if value.get("flow").is_none() {
+        let Some(fields) = value.as_object() else {
+            return Err(Error::new(ErrorKind::Checkpoint, "invalid checkpoint JSON"));
+        };
+        let mut flow = fields.clone();
+        let version = flow.remove("version").unwrap_or(serde_json::Value::Null);
+        flow.insert(
+            "kind".to_string(),
+            serde_json::Value::String("upload".to_string()),
+        );
+        let mut record = serde_json::Map::new();
+        record.insert("version".to_string(), version);
+        record.insert("flow".to_string(), serde_json::Value::Object(flow));
+        serde_json::Value::Object(record)
+    } else {
+        value
+    };
+    serde_json::from_value(wrapped)
+        .map_err(|e| Error::new(ErrorKind::Checkpoint, "invalid checkpoint JSON").with_source(e))
 }
 // 在序列化过程中限制分配，而不是先生成任意大的 JSON 再拒绝。
 struct BoundedJson(Vec<u8>);

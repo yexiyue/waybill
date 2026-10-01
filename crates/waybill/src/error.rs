@@ -32,6 +32,8 @@ pub enum ErrorKind {
     Authentication,
     /// 目标名称冲突。
     Conflict,
+    /// 引用的对象不存在。
+    NotFound,
     /// 后端响应不符合协议。
     Protocol,
     /// 已完成对象不可用；不自动复活。

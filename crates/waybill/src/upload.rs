@@ -2,7 +2,8 @@
 use crate::{
     BoxFuture,
     budget::ResourceBudget,
-    checkpoint::{Checkpoint, CheckpointStore, DriverState, FORMAT_VERSION},
+    checkpoint::{Checkpoint, CheckpointStore, DriverState, Flow, UploadFlow},
+    download::Verification,
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
     source::{Source, SourceIdentity},
@@ -42,7 +43,7 @@ impl UploadIntent {
     }
 }
 /// 操作标识：1..=128 字节的 ASCII 字母数字与 `-_.:`。
-fn valid_operation(operation: &str) -> bool {
+pub(crate) fn valid_operation(operation: &str) -> bool {
     !operation.is_empty()
         && operation.len() <= 128
         && operation
@@ -81,6 +82,9 @@ pub struct Receipt {
     pub object: String,
     /// 远端确认长度。
     pub size: u64,
+    /// 交付内容的验证证据；v1 回执按未验证兼容解码。
+    #[serde(default)]
+    pub verified: Verification,
 }
 /// 服务端对账结果；每次状态更新都需持久化。
 #[derive(Debug)]
@@ -225,35 +229,44 @@ impl UploadEngine {
         if !valid_digest(&identity.blake3) {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid source digest"));
         }
-        let mut checkpoint = match lease.load().await? {
+        let mut flow = match lease.load().await? {
             Some(saved) => {
-                if saved.version != FORMAT_VERSION {
+                if !Checkpoint::supported(saved.version, &saved.flow) {
                     return Err(Error::new(
                         ErrorKind::IncompatibleVersion,
                         "checkpoint version",
                     ));
                 }
-                if saved.intent != intent || saved.service != sink.identity() {
-                    return Err(Error::new(
-                        ErrorKind::IdentityMismatch,
-                        "checkpoint binding",
-                    ));
+                match saved.flow {
+                    Flow::Upload(flow) => {
+                        if flow.intent != intent || flow.service != sink.identity() {
+                            return Err(Error::new(
+                                ErrorKind::IdentityMismatch,
+                                "checkpoint binding",
+                            ));
+                        }
+                        if flow.source != identity {
+                            return Err(Error::new(
+                                ErrorKind::SourceChanged,
+                                "source identity changed",
+                            ));
+                        }
+                        if flow.acknowledged > identity.size {
+                            return Err(Error::new(ErrorKind::Checkpoint, "invalid saved offset"));
+                        }
+                        flow
+                    }
+                    Flow::Download(_) => {
+                        return Err(Error::new(
+                            ErrorKind::IdentityMismatch,
+                            "checkpoint binding",
+                        ));
+                    }
                 }
-                if saved.source != identity {
-                    return Err(Error::new(
-                        ErrorKind::SourceChanged,
-                        "source identity changed",
-                    ));
-                }
-                if saved.acknowledged > identity.size {
-                    return Err(Error::new(ErrorKind::Checkpoint, "invalid saved offset"));
-                }
-                saved
             }
             None => {
                 let driver = sink.prepare(&intent, &identity).await?;
-                let saved = Checkpoint {
-                    version: FORMAT_VERSION,
+                let flow = UploadFlow {
                     intent,
                     service: sink.identity(),
                     source: identity,
@@ -262,22 +275,20 @@ impl UploadEngine {
                     driver,
                     receipt: None,
                 };
-                lease.save(&saved).await?;
-                saved
+                lease.save(&flow.checkpoint()).await?;
+                flow
             }
         };
-        let mut status = sink
-            .probe(&checkpoint.intent, &checkpoint.source, &checkpoint.driver)
-            .await?;
+        let mut status = sink.probe(&flow.intent, &flow.source, &flow.driver).await?;
         let mut restarts = 0;
         let mut sent = 0u64;
         loop {
             match status {
                 SessionStatus::Complete { state, receipt } => {
-                    if receipt.operation != checkpoint.intent.operation
-                        || receipt.service != checkpoint.service
-                        || receipt.target != checkpoint.intent.target
-                        || receipt.size != checkpoint.source.size
+                    if receipt.operation != flow.intent.operation
+                        || receipt.service != flow.service
+                        || receipt.target != flow.intent.target
+                        || receipt.size != flow.source.size
                         || receipt.object.is_empty()
                     {
                         return Err(Error::new(
@@ -285,23 +296,23 @@ impl UploadEngine {
                             "invalid completion receipt",
                         ));
                     }
-                    if source.identity().await? != checkpoint.source {
+                    if source.identity().await? != flow.source {
                         return Err(Error::new(
                             ErrorKind::SourceChanged,
                             "source changed during upload",
                         ));
                     }
-                    checkpoint.driver = state;
-                    checkpoint.acknowledged = checkpoint.source.size;
-                    checkpoint.receipt = Some(receipt.clone());
-                    lease.save(&checkpoint).await?;
-                    report(&checkpoint, sent, progress);
+                    flow.driver = state;
+                    flow.acknowledged = flow.source.size;
+                    flow.receipt = Some(receipt.clone());
+                    lease.save(&flow.checkpoint()).await?;
+                    report(&flow, sent, progress);
                     return Ok(receipt);
                 }
                 SessionStatus::Expired(state) => {
-                    checkpoint.driver = state;
-                    lease.save(&checkpoint).await?;
-                    if checkpoint.receipt.is_some() {
+                    flow.driver = state;
+                    lease.save(&flow.checkpoint()).await?;
+                    if flow.receipt.is_some() {
                         return Err(Error::new(
                             ErrorKind::ObjectUnavailable,
                             "completed object unavailable",
@@ -317,61 +328,60 @@ impl UploadEngine {
                         ));
                     }
                     restarts += 1;
-                    checkpoint.restarts = checkpoint.restarts.checked_add(1).ok_or_else(|| {
+                    flow.restarts = flow.restarts.checked_add(1).ok_or_else(|| {
                         Error::new(ErrorKind::Checkpoint, "restart counter overflow")
                     })?;
-                    checkpoint.acknowledged = 0;
-                    lease.save(&checkpoint).await?;
-                    report(&checkpoint, sent, progress);
+                    flow.acknowledged = 0;
+                    lease.save(&flow.checkpoint()).await?;
+                    report(&flow, sent, progress);
                     status = sink
-                        .initialize(&checkpoint.intent, &checkpoint.source, &checkpoint.driver)
+                        .initialize(&flow.intent, &flow.source, &flow.driver)
                         .await?;
                 }
                 SessionStatus::Uninitialized(state) => {
-                    if checkpoint.receipt.is_some() {
+                    if flow.receipt.is_some() {
                         return Err(Error::new(
                             ErrorKind::ObjectUnavailable,
                             "completed object unavailable",
                         ));
                     }
-                    checkpoint.driver = state;
-                    lease.save(&checkpoint).await?;
+                    flow.driver = state;
+                    lease.save(&flow.checkpoint()).await?;
                     if stop.is_stopped() {
                         return Err(Error::new(ErrorKind::Paused, "upload paused"));
                     }
                     status = sink
-                        .initialize(&checkpoint.intent, &checkpoint.source, &checkpoint.driver)
+                        .initialize(&flow.intent, &flow.source, &flow.driver)
                         .await?;
                 }
                 SessionStatus::Ready { state, offset } => {
-                    if checkpoint.receipt.is_some() {
+                    if flow.receipt.is_some() {
                         return Err(Error::new(
                             ErrorKind::ResultUnknown,
                             "completed object no longer confirmed",
                         ));
                     }
-                    if offset > checkpoint.source.size {
+                    if offset > flow.source.size {
                         return Err(Error::new(
                             ErrorKind::Protocol,
                             "remote offset exceeds source",
                         ));
                     }
-                    checkpoint.driver = state;
-                    checkpoint.acknowledged = offset;
-                    lease.save(&checkpoint).await?;
-                    report(&checkpoint, sent, progress);
+                    flow.driver = state;
+                    flow.acknowledged = offset;
+                    lease.save(&flow.checkpoint()).await?;
+                    report(&flow, sent, progress);
                     if stop.is_stopped() {
                         return Err(Error::new(ErrorKind::Paused, "upload paused"));
                     }
-                    if offset == checkpoint.source.size {
+                    if offset == flow.source.size {
                         return Err(Error::new(
                             ErrorKind::ResultUnknown,
                             "all bytes confirmed without completion",
                         ));
                     }
-                    let length = (checkpoint.source.size - offset)
-                        .min(self.budget.chunk_size() as u64)
-                        as usize;
+                    let length =
+                        (flow.source.size - offset).min(self.budget.chunk_size() as u64) as usize;
                     let data = source.read_range(offset, length).await?;
                     if data.len() != length {
                         return Err(Error::new(ErrorKind::Protocol, "short source range"));
@@ -384,13 +394,7 @@ impl UploadEngine {
                     }
                     sent = sent.saturating_add(length as u64);
                     status = match sink
-                        .write_chunk(
-                            &checkpoint.intent,
-                            &checkpoint.source,
-                            &checkpoint.driver,
-                            offset,
-                            data,
-                        )
+                        .write_chunk(&flow.intent, &flow.source, &flow.driver, offset, data)
                         .await
                     {
                         Ok(next) => {
@@ -405,18 +409,15 @@ impl UploadEngine {
                         }
                         Err(error) => {
                             // 请求可能已生效，必须先对账；对账失败则保留旧状态等待下次恢复。
-                            match sink
-                                .probe(&checkpoint.intent, &checkpoint.source, &checkpoint.driver)
-                                .await
-                            {
+                            match sink.probe(&flow.intent, &flow.source, &flow.driver).await {
                                 Ok(done @ SessionStatus::Complete { .. }) => done,
                                 Ok(SessionStatus::Ready { state, offset })
-                                    if offset <= checkpoint.source.size =>
+                                    if offset <= flow.source.size =>
                                 {
-                                    checkpoint.driver = state;
-                                    checkpoint.acknowledged = offset;
-                                    lease.save(&checkpoint).await?;
-                                    report(&checkpoint, sent, progress);
+                                    flow.driver = state;
+                                    flow.acknowledged = offset;
+                                    lease.save(&flow.checkpoint()).await?;
+                                    report(&flow, sent, progress);
                                     return Err(error);
                                 }
                                 Ok(expired @ SessionStatus::Expired(_)) => expired,
@@ -437,13 +438,13 @@ impl UploadEngine {
     pub async fn confirm(&self, store: &dyn CheckpointStore, receipt: &Receipt) -> Result<()> {
         let lease = store.acquire(&receipt.operation).await?;
         if let Some(checkpoint) = lease.load().await? {
-            if checkpoint.version != FORMAT_VERSION {
+            if !Checkpoint::supported(checkpoint.version, &checkpoint.flow) {
                 return Err(Error::new(
                     ErrorKind::IncompatibleVersion,
                     "checkpoint version",
                 ));
             }
-            if checkpoint.receipt.as_ref() != Some(receipt) {
+            if checkpoint.upload().and_then(|flow| flow.receipt.as_ref()) != Some(receipt) {
                 return Err(Error::new(ErrorKind::IdentityMismatch, "receipt mismatch"));
             }
             lease.remove().await?;
@@ -451,12 +452,12 @@ impl UploadEngine {
         Ok(())
     }
 }
-fn report(checkpoint: &Checkpoint, sent: u64, progress: &(dyn Fn(Progress) + Send + Sync)) {
+fn report(flow: &UploadFlow, sent: u64, progress: &(dyn Fn(Progress) + Send + Sync)) {
     progress(Progress {
         sent,
-        persisted: checkpoint.acknowledged,
-        total: checkpoint.source.size,
-        epoch: checkpoint.restarts,
-        complete: checkpoint.receipt.is_some(),
+        persisted: flow.acknowledged,
+        total: flow.source.size,
+        epoch: flow.restarts,
+        complete: flow.receipt.is_some(),
     });
 }
