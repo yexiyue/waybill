@@ -122,6 +122,24 @@ The first intended consumer is
 Drive delivery implementations provide the starting material. waybill's public
 contracts remain independent of its UI, device identity, and P2P protocol.
 
+## Use wb
+
+```sh
+cargo run -p waybill-cli -- login gdrive --client /path/to/desktop.json
+cargo run -p waybill-cli -- put ./file.zip 'gdrive://account@example.com/backup/'
+cargo run -p waybill-cli -- status
+```
+
+Authorization requests `drive.file` for app-owned uploads and `drive.readonly`
+for reading Drive files; file browsing and downloads remain planned.
+Login uses your Google email as the account name; `--account` sets a local alias.
+Multiple sources require a destination ending in `/`. Directories must belong to
+this app, or use `--root <folder ID>` for an app-accessible root. A TTY opens the
+fullscreen dashboard; `--no-tui` selects plain output and `--json` streams events.
+The first Ctrl-C stops gracefully; the second aborts immediately. Rerun the same
+command to resume or reuse the completed receipt. `status` lists pending and
+completed records. Removing local completion records removes the skip guarantee.
+
 ## Meet Bill
 
 <p align="center">

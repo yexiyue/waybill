@@ -1,11 +1,15 @@
-//! `wb status`：枚举本机在途 checkpoint。
+//! `wb status`：枚举本机恢复记录与已完成回执。
 //!
 //! 只读公共信封字段；驱动 payload 可能携带会话凭证，绝不渲染。
 //! 不获取排他租约：存储的原子替换保证读到旧或新的完整记录。
 use crate::{error::CliError, paths::Layout, ui::human_bytes};
 use serde::Serialize;
-use std::path::Path;
+use std::{io::Read, path::Path};
 use waybill::checkpoint::{Checkpoint, FORMAT_VERSION};
+
+// 与 FileCheckpointStore 的记录大小上限一致，避免损坏文件导致无界读取。
+const CHECKPOINT_LIMIT: usize = 1024 * 1024;
+const RECORD_LIMIT: usize = 1000;
 
 /// 单条在途会话的展示行；字段与 JSON 输出共用。
 #[derive(Serialize)]
@@ -17,7 +21,7 @@ struct SessionRow {
     acknowledged: u64,
     total: u64,
     restarts: u32,
-    /// in_flight = 上传未完成；awaiting_receipt = 远端已完成、待确认清理。
+    /// in_flight = 上传未完成；completed = 已完成，保留回执用于重复投递对账。
     state: &'static str,
 }
 
@@ -30,7 +34,7 @@ struct Unreadable {
 pub async fn run(json: bool) -> Result<(), CliError> {
     let layout = Layout::discover()?;
     let dir = layout.checkpoints();
-    let (rows, unreadable) = scan(&dir);
+    let (rows, unreadable) = scan(&dir)?;
     if json {
         println!("{}", serde_json::to_string(&rows)?);
     } else {
@@ -39,25 +43,41 @@ pub async fn run(json: bool) -> Result<(), CliError> {
     for entry in &unreadable {
         eprintln!("wb: 无法读取 {}: {}", entry.file, entry.reason);
     }
+    if !unreadable.is_empty() {
+        return Err(CliError::Message(format!(
+            "{} 条运单记录无法读取；上方结果不完整",
+            unreadable.len()
+        )));
+    }
     Ok(())
 }
 
-fn scan(dir: &Path) -> (Vec<SessionRow>, Vec<Unreadable>) {
+fn scan(dir: &Path) -> Result<(Vec<SessionRow>, Vec<Unreadable>), CliError> {
     let mut rows = Vec::new();
     let mut unreadable = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (rows, unreadable);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((rows, unreadable));
+        }
+        Err(error) => return Err(error.into()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
+        if rows.len() + unreadable.len() >= RECORD_LIMIT {
+            return Err(CliError::Message(
+                "运单记录超过 1000 条；请归档不再需要的本机记录后重试".into(),
+            ));
+        }
         let file = entry.file_name().to_string_lossy().into_owned();
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = read_checkpoint(&path) else {
             unreadable.push(Unreadable {
                 file,
-                reason: "read failed",
+                reason: "read failed or record too large",
             });
             continue;
         };
@@ -71,7 +91,7 @@ fn scan(dir: &Path) -> (Vec<SessionRow>, Vec<Unreadable>) {
                 total: checkpoint.source.size,
                 restarts: checkpoint.restarts,
                 state: if checkpoint.receipt.is_some() {
-                    "awaiting_receipt"
+                    "completed"
                 } else {
                     "in_flight"
                 },
@@ -87,15 +107,28 @@ fn scan(dir: &Path) -> (Vec<SessionRow>, Vec<Unreadable>) {
         }
     }
     rows.sort_by(|a, b| a.operation.cmp(&b.operation));
-    (rows, unreadable)
+    Ok((rows, unreadable))
+}
+
+fn read_checkpoint(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take((CHECKPOINT_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > CHECKPOINT_LIMIT {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    Ok(bytes)
 }
 
 fn render(dir: &Path, rows: &[SessionRow]) {
-    println!("在途运单 {} 条  checkpoint: {}", rows.len(), dir.display());
+    println!("运单记录 {} 条  checkpoint: {}", rows.len(), dir.display());
     for row in rows {
-        let percent = (row.acknowledged * 100).checked_div(row.total).unwrap_or(0);
-        let state = if row.state == "awaiting_receipt" {
-            "待确认回执"
+        let percent = (u128::from(row.acknowledged) * 100)
+            .checked_div(u128::from(row.total))
+            .unwrap_or(0);
+        let state = if row.state == "completed" {
+            "已完成"
         } else {
             "在途"
         };
@@ -176,12 +209,45 @@ mod tests {
         std::fs::write(root.join("bbb.lock"), b"").unwrap();
         std::fs::write(root.join("broken.json"), b"{").unwrap();
 
-        let (rows, unreadable) = scan(&root);
+        let (rows, unreadable) = scan(&root).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].operation, "op-aaa");
         assert_eq!(rows[0].state, "in_flight");
-        assert_eq!(rows[1].state, "awaiting_receipt");
+        assert_eq!(rows[1].state, "completed");
         assert_eq!(unreadable.len(), 1);
         assert_eq!(unreadable[0].reason, "decode failed");
+    }
+
+    #[test]
+    fn missing_directory_is_empty_but_invalid_directory_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(scan(&missing).unwrap().0.is_empty());
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(scan(&file).is_err());
+    }
+
+    #[test]
+    fn record_inventory_has_a_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=RECORD_LIMIT {
+            std::fs::write(dir.path().join(format!("{index}.json")), b"{").unwrap();
+        }
+        assert!(scan(dir.path()).is_err());
+    }
+
+    #[test]
+    fn oversized_records_are_reported_without_unbounded_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("large.json"),
+            vec![b' '; CHECKPOINT_LIMIT + 1],
+        )
+        .unwrap();
+        let (rows, unreadable) = scan(dir.path()).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].reason, "read failed or record too large");
     }
 }

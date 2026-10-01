@@ -21,19 +21,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
             no_browser,
             account,
         } => login::run(provider, client, no_browser, account, json).await,
-        Command::Put {
-            sources,
-            dest,
-            operation,
-            conflict,
-            root,
-            no_tui,
-        } => {
-            put::run(
-                sources, dest, operation, conflict, root, no_tui, json, verbose,
-            )
-            .await
-        }
+        Command::Put(args) => put::run(args, json, verbose).await,
         Command::Status => status::run(json).await,
     }
 }

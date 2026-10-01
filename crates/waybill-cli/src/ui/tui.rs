@@ -13,21 +13,32 @@ use ratatui_kit::{
         text::{Line, Span},
     },
 };
-use std::time::Instant;
-use tokio::sync::mpsc::UnboundedReceiver;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
+use tokio::sync::mpsc::Receiver;
 use waybill::upload::StopToken;
 
 use crate::error::CliError;
 
 /// 交接给面板的一次性资源。
 pub(crate) struct Handoff {
-    pub receiver: UnboundedReceiver<TransferEvent>,
+    pub receiver: Receiver<TransferEvent>,
     pub stop: StopToken,
     pub banner: String,
-    pub total_files: usize,
+    pub queued_files: Vec<(String, String)>,
 }
 
-static HANDOFF: Atom<Option<Handoff>> = Atom::new(|| None);
+struct Session {
+    handoff: Handoff,
+    forced: Arc<AtomicBool>,
+}
+
+static HANDOFF: Atom<Option<Session>> = Atom::new(|| None);
 
 // 品牌参考色的终端适配：文档值 #1E4C4C 在深色终端上作文字不可读，
 // 文字与边框用提亮青绿，填充与选中底色保留品牌青绿。
@@ -37,12 +48,17 @@ const PAPER: Color = Color::Rgb(245, 240, 229);
 const ORANGE: Color = Color::Rgb(216, 122, 55);
 const INK_DIM: Color = Color::Rgb(191, 181, 166);
 
-pub(crate) async fn run(handoff: Handoff) -> Result<(), CliError> {
-    HANDOFF.set(Some(handoff));
+pub(crate) async fn run(handoff: Handoff) -> Result<bool, CliError> {
+    let forced = Arc::new(AtomicBool::new(false));
+    HANDOFF.set(Some(Session {
+        handoff,
+        forced: forced.clone(),
+    }));
     element!(App)
         .fullscreen()
         .await
-        .map_err(|error| CliError::Message(format!("面板运行失败：{error}")))
+        .map_err(|error| CliError::Message(format!("面板运行失败：{error}")))?;
+    Ok(forced.load(Ordering::Acquire))
 }
 
 fn brand_palette() -> Palette {
@@ -82,6 +98,7 @@ enum Status {
 fn App(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut files = hooks.use_state(Vec::<RowState>::default);
     let mut stop_token = hooks.use_state(|| None::<StopToken>);
+    let mut force_exit = hooks.use_state(|| None::<Arc<AtomicBool>>);
     let mut stopping = hooks.use_state(|| false);
     let mut finished = hooks.use_state(|| false);
     let mut banner = hooks.use_state(String::default);
@@ -99,21 +116,27 @@ fn App(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
 
     // 事件泵：一次性取走交接资源并驱动全部行状态。
     hooks.use_future(async move {
-        let Some(Handoff {
-            receiver,
-            stop,
-            banner: handoff_banner,
-            total_files,
+        let Some(Session {
+            handoff:
+                Handoff {
+                    receiver,
+                    stop,
+                    banner: handoff_banner,
+                    queued_files,
+                },
+            forced,
         }) = HANDOFF.state().write().take()
         else {
             return;
         };
         banner.set(handoff_banner);
         stop_token.set(Some(stop));
-        let placeholder = (0..total_files)
-            .map(|_| RowState {
-                name: String::new(),
-                target: String::new(),
+        force_exit.set(Some(forced));
+        let placeholder = queued_files
+            .into_iter()
+            .map(|(name, target)| RowState {
+                name,
+                target,
                 operation: String::new(),
                 size: 0,
                 persisted: 0,
@@ -168,10 +191,16 @@ fn App(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         };
                     }
                 }
-                TransferEvent::Failed { index, message, .. } => {
+                TransferEvent::Failed {
+                    index,
+                    name,
+                    message,
+                    paused,
+                } => {
                     let mut rows = files.write();
                     if let Some(row) = rows.get_mut(index) {
-                        row.status = if message.starts_with("Paused") {
+                        row.name = name;
+                        row.status = if paused {
                             Status::Paused { message }
                         } else {
                             Status::Failed { message }
@@ -186,6 +215,10 @@ fn App(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 }
             }
         }
+        // 传输任务异常退出时没有 Done；交还 put 检查 JoinError。
+        if !finished.get() {
+            exit_when_settled();
+        }
     });
 
     hooks.use_event_handler(EventScope::Global, EventPriority::High, move |event| {
@@ -194,6 +227,12 @@ fn App(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         };
         if key.kind != KeyEventKind::Press {
             return EventResult::Ignored;
+        }
+        // 模态窗口的 Esc 用于关闭窗口，不应触发上传暂停。
+        if key.code == KeyCode::Esc && (detail_open.get() || help_open.get()) {
+            detail_open.set(false);
+            help_open.set(false);
+            return EventResult::Consumed;
         }
         let wants_stop = matches!(
             key.code,
@@ -206,7 +245,10 @@ fn App(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 return EventResult::Consumed;
             }
             if stopping.get() {
-                // 第二次按下：不再等待对账落盘，立即交还（引擎随进程退出）。
+                // 第二次按下由 put 中止任务，保留最近的持久 checkpoint。
+                if let Some(forced) = force_exit.read().as_ref() {
+                    forced.store(true, Ordering::Release);
+                }
                 exit_now();
                 return EventResult::Consumed;
             }
@@ -331,7 +373,12 @@ fn render_row(row: &RowState, _selected: bool) -> Vec<TableCell> {
         Status::Failed { .. } => Line::from("失败").fg(ORANGE),
         Status::Paused { .. } => Line::from("已暂停").fg(ORANGE),
     };
-    let bar = progress_bar(row.persisted, row.size);
+    let waiting = matches!(row.status, Status::Waiting);
+    let bar = if waiting {
+        Line::from("—").fg(INK_DIM)
+    } else {
+        progress_bar(row.persisted, row.size)
+    };
     let speed = if row.speed > 0.0 {
         format!("{}/s", crate::ui::human_bytes(row.speed as u64))
     } else {
@@ -339,7 +386,12 @@ fn render_row(row: &RowState, _selected: bool) -> Vec<TableCell> {
     };
     vec![
         TableCell::new(row.name.clone()),
-        TableCell::new(crate::ui::human_bytes(row.size)).alignment(TableCellAlignment::Right),
+        TableCell::new(if waiting {
+            "—".into()
+        } else {
+            crate::ui::human_bytes(row.size)
+        })
+        .alignment(TableCellAlignment::Right),
         TableCell::new(bar),
         TableCell::new(speed).alignment(TableCellAlignment::Right),
         TableCell::new(status),

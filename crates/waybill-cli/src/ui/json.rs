@@ -3,11 +3,11 @@ use crate::{error::CliError, transfer::Event};
 use serde_json::{Value, json};
 use std::io::{BufWriter, Write};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
-pub(crate) async fn run(mut rx: UnboundedReceiver<Event>) -> Result<(), CliError> {
+pub(crate) async fn run(mut rx: Receiver<Event>) -> Result<(), CliError> {
     let mut stdout = BufWriter::new(std::io::stdout().lock());
     let mut last_progress: Option<Instant> = None;
     while let Some(event) = rx.recv().await {
@@ -27,6 +27,7 @@ pub(crate) async fn run(mut rx: UnboundedReceiver<Event>) -> Result<(), CliError
         }
         let line = encode(event);
         writeln!(stdout, "{line}")?;
+        stdout.flush()?;
     }
     stdout.flush()?;
     Ok(())

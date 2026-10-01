@@ -12,6 +12,7 @@ pub(crate) struct DriveClient {
     pub(crate) http: reqwest::Client,
     credentials: Arc<dyn TokenProvider>,
     pub(crate) api_root: String,
+    pub(crate) about_url: String,
     pub(crate) upload_root: String,
     #[cfg(test)]
     pub(crate) test_origin: Option<url::Url>,
@@ -26,6 +27,7 @@ impl DriveClient {
                 .map_err(|_| Error::new(ErrorKind::InvalidInput, "Drive HTTP client"))?,
             credentials,
             api_root: "https://www.googleapis.com/drive/v3".into(),
+            about_url: "https://www.googleapis.com/drive/v2/about".into(),
             upload_root: "https://www.googleapis.com/upload/drive/v3/files".into(),
             #[cfg(test)]
             test_origin: None,
@@ -140,6 +142,31 @@ impl DriveClient {
         }
         tokio::time::sleep(Duration::from_secs(seconds)).await;
     }
+    /// drive.file 不保证根目录能经 files.get 读取；v2 about 可返回真实根 ID。
+    /// https://developers.google.com/workspace/drive/api/reference/rest/v2/about/get
+    pub(crate) async fn root_folder_id(&self) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct About {
+            root_folder_id: String,
+        }
+        let response = self
+            .request(
+                self.http
+                    .get(&self.about_url)
+                    .query(&[("fields", "rootFolderId")]),
+                true,
+            )
+            .await?;
+        ensure_success(&response)?;
+        let id = read_json::<About>(response).await?.root_folder_id;
+        validate_id(&id)?;
+        if id == "root" {
+            return Err(protocol());
+        }
+        Ok(id)
+    }
+
     pub(crate) async fn get_file(&self, id: &str) -> Result<Option<DriveFile>> {
         validate_id(id)?;
         let response = self

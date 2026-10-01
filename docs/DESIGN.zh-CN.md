@@ -515,6 +515,26 @@ capability 原样复制为所有交付能力。
   恢复和确认过程。源、凭证、私有状态不写 Debug / 日志。hash 属性是操作对账证据，
   不证明远端内容完整性，也不承诺跨进程并发同名目标的统一原子发布。
 
+### CLI 宿主边界
+
+`wb` 是公开上传契约的消费者。`cli` 定义参数，`cmd` 做本地预检与组装，
+`transfer::Runner` 顺序执行队列；JSON、行式输出和全屏面板只消费事件。
+`status` 最多扫描 1000 条记录，每条至多 1 MiB。事件通道最多 64 条：生命周期事件等待交付，拥堵时丢弃进度样本；上传进度仍以
+引擎持久确认量为准。首次停止等待在途请求对账，二次停止中止任务并保留最近记录。
+
+`oauth` 负责桌面 PKCE、回环回调和 Google 身份查询；`credentials` 原子保存应用与
+token 并拥有刷新。账户别名只用于本机凭证目录，service 命名空间使用实际 Google
+`permissionId`，因此同一别名改绑账户不能复用旧恢复状态。CLI 请求 `drive.file` + `drive.readonly`，前者上传本应用文件，后者为后续云盘列表与
+下载提供只读权限；列表选择与下载仍待 M2。`gdrive_host` 将其与 OAuth
+应用、根目录组装成实例，具体 Drive 协议仍归 service。仅 `drive.file` 的真机授权下读取
+`files/root` 返回 404；默认根通过 [v2 about.rootFolderId](https://developers.google.com/workspace/drive/api/reference/rest/v2/about)
+解析真实 ID（2026-10-01 已验证），无需扩大 scope；显式根 ID 保留可访问性与目录校验。
+
+CLI 保留带回执的完成 checkpoint 作为本机幂等记录，不在输出事件后立即 `confirm`。
+重跑同一命令先复核源与实例，再返回原回执；`status` 显示 `in_flight` / `completed`。
+删除本机完成记录后不保证重复投递自动跳过：当前 service 不跨操作搜索远端回执。
+上传期间仍要求消费者冻结源文件；文件版本变化按公开契约明确拒绝。
+
 抽取基线：SwarmDrop `0a81f133214958f7b01ae9a0e4624dc87e16014b`，
 `crates/storage-cloud/src/{gdrive,staging,persistence,publish}`。MIT 来源声明随衍生代码保留。
 只复用协议和恢复机制，不复制设备目录、接收记录模型、CloudAccountManager 或 UI 类型。

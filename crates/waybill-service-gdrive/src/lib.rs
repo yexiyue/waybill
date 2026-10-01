@@ -26,7 +26,9 @@ pub struct GdriveConfig {
     pub account: String,
     /// OAuth 应用标识；切换应用不能共享 appProperties 的恢复命名空间。
     pub oauth_application: String,
-    /// Drive 根目录对象 ID，可使用 root 别名。
+    /// Drive 根目录对象 ID；root 别名通过 v2 about 解析为真实根 ID，
+    /// 不要求 drive.file 凭证具备根目录的 files.get 可见性。
+    /// 显式 ID 仍需验证对象是可访问的文件夹。
     pub root: String,
 }
 /// 独立 GDrive service，消费者可注入核心引擎。

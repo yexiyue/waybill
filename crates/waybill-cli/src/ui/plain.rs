@@ -4,10 +4,10 @@
 use crate::{error::CliError, transfer::Event, ui::human_bytes};
 use std::io::{BufWriter, IsTerminal, Write};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 pub(crate) async fn run(
-    mut rx: UnboundedReceiver<Event>,
+    mut rx: Receiver<Event>,
     total_files: usize,
     verbose: bool,
 ) -> Result<(), CliError> {
@@ -33,7 +33,7 @@ pub(crate) async fn run(
                     total_files,
                     name,
                     human_bytes(size),
-                    &operation[..operation.len().min(11)]
+                    operation.chars().take(11).collect::<String>()
                 )?;
                 stdout.flush()?;
                 last = None;
@@ -62,8 +62,8 @@ pub(crate) async fn run(
                         human_bytes(speed as u64)
                     )?;
                     let _ = stderr.flush();
+                    last = Some((persisted, Instant::now()));
                 }
-                last = Some((persisted, Instant::now()));
             }
             Event::Completed { index, receipt } => {
                 clear_progress(&mut stderr, progress_tty && last.is_some());
@@ -103,9 +103,12 @@ pub(crate) async fn run(
                 last = None;
             }
             Event::Done {
-                receipts, failures, ..
+                receipts,
+                failures,
+                stopped,
             } => {
-                writeln!(stdout, "运单完成 {receipts}，失败 {failures}")?;
+                let state = if stopped { "已停止" } else { "队列结束" };
+                writeln!(stdout, "{state}：运单完成 {receipts}，失败 {failures}")?;
                 stdout.flush()?;
             }
         }

@@ -201,6 +201,7 @@ fn drive(server: &Server, tokens: Arc<Tokens>) -> Gdrive {
     .unwrap();
     let api = Arc::get_mut(&mut drive.api).unwrap();
     api.api_root = format!("{}/drive/v3", server.origin);
+    api.about_url = format!("{}/drive/v2/about", server.origin);
     api.upload_root = format!("{}/upload/drive/v3/files", server.origin);
     api.test_origin = Some(url::Url::parse(&server.origin).unwrap());
     drive
@@ -227,9 +228,9 @@ fn prepare() -> Vec<Reply> {
     vec![
         Reply::new(
             "GET",
-            "/drive/v3/files/root",
+            "/drive/v2/about",
             200,
-            json!({"id":"folder-1","name":"root","mimeType":"application/vnd.google-apps.folder"}),
+            json!({"rootFolderId":"folder-1"}),
         ),
         listing(),
         Reply::new(
@@ -597,7 +598,7 @@ async fn empty_file_and_authorization_refresh_are_supported() {
     let store = FileCheckpointStore::new(dir.path().join("cp"));
     server.add(vec![Reply::new(
         "GET",
-        "/drive/v3/files/root",
+        "/drive/v2/about",
         401,
         serde_json::Value::Null,
     )]);
@@ -1053,6 +1054,7 @@ async fn resume_child() {
     .unwrap();
     let api = Arc::get_mut(&mut drive.api).unwrap();
     api.api_root = format!("{origin}/drive/v3");
+    api.about_url = format!("{origin}/drive/v2/about");
     api.upload_root = format!("{origin}/upload/drive/v3/files");
     api.test_origin = Some(url::Url::parse(&origin).unwrap());
     let source = FileSource::open(root.join("source.bin")).await.unwrap();
@@ -1084,11 +1086,9 @@ async fn target_conflicts_require_explicit_suffix_and_directories_require_owners
     let root = || {
         Reply::new(
             "GET",
-            "/drive/v3/files/root",
+            "/drive/v2/about",
             200,
-            json!({
-                "id":"folder-1", "name":"root", "mimeType":"application/vnd.google-apps.folder"
-            }),
+            json!({"rootFolderId":"folder-1"}),
         )
     };
     let occupied = || {
@@ -1156,9 +1156,9 @@ async fn planned_directory_id_survives_a_lost_create_response() {
     server.add(vec![
         Reply::new(
             "GET",
-            "/drive/v3/files/root",
+            "/drive/v2/about",
             200,
-            json!({"id":"folder-1","name":"root","mimeType":"application/vnd.google-apps.folder"}),
+            json!({"rootFolderId":"folder-1"}),
         ),
         listing(),
         Reply::new(
@@ -1259,5 +1259,97 @@ async fn a_stop_during_source_read_prevents_scheduling_another_request() {
             .acknowledged,
         0
     );
+    server.finished();
+}
+
+#[tokio::test]
+async fn default_root_uses_about_when_root_file_is_not_visible() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![Reply::new(
+        "GET",
+        "/drive/v3/files/root",
+        404,
+        serde_json::Value::Null,
+    )]);
+    assert!(drive.api.get_file("root").await.unwrap().is_none());
+    server.add(vec![
+        Reply::new("GET", "/drive/v2/about?fields=rootFolderId", 200, json!({"rootFolderId":"folder-1"})),
+        Reply::new("GET", "/drive/v3/files?q=trashed+%3D+false+and+%27folder-1%27+in+parents+and+name+%3D+%27payload.bin%27", 200, json!({"files":[]})),
+        Reply::new("GET", "/drive/v3/files/generateIds", 200, json!({"ids":["object-1"]})),
+    ]);
+    let state = drive.plan_target(&intent()).await.unwrap();
+    assert_eq!(state.parent_id, "folder-1");
+    let source = waybill::source::SourceIdentity {
+        reference: "source".into(),
+        revision: "v1".into(),
+        size: 1,
+        blake3: "0".repeat(64),
+    };
+    let mut remote = object(&drive, &source);
+    remote["parents"] = json!(["wrong-parent"]);
+    server.add(vec![Reply::new(
+        "GET",
+        "/drive/v3/files/object-1",
+        200,
+        remote,
+    )]);
+    assert_eq!(
+        drive
+            .probe(&intent(), &source, &state.encode().unwrap())
+            .await
+            .err()
+            .unwrap()
+            .kind,
+        ErrorKind::ResultUnknown
+    );
+    server.finished();
+}
+
+#[tokio::test]
+async fn explicit_root_still_requires_a_matching_accessible_folder() {
+    let server = Server::new().await;
+    let mut drive = drive(&server, Arc::new(Tokens::new()));
+    drive.config.root = "explicit-root".into();
+    for (status, body, expected) in [
+        (404, serde_json::Value::Null, ErrorKind::InvalidInput),
+        (
+            200,
+            json!({"id":"explicit-root","name":"file","mimeType":"application/octet-stream"}),
+            ErrorKind::InvalidInput,
+        ),
+        (
+            200,
+            json!({"id":"other-root","name":"folder","mimeType":"application/vnd.google-apps.folder"}),
+            ErrorKind::IdentityMismatch,
+        ),
+    ] {
+        server.add(vec![Reply::new(
+            "GET",
+            "/drive/v3/files/explicit-root",
+            status,
+            body,
+        )]);
+        assert_eq!(
+            drive.plan_target(&intent()).await.err().unwrap().kind,
+            expected
+        );
+    }
+    server.finished();
+}
+
+#[tokio::test]
+async fn default_root_rejects_invalid_about_identity() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    for id in ["root", "", "../folder"] {
+        server.add(vec![Reply::new(
+            "GET",
+            "/drive/v2/about",
+            200,
+            json!({"rootFolderId":id}),
+        )]);
+        assert!(drive.plan_target(&intent()).await.is_err());
+    }
     server.finished();
 }

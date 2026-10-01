@@ -1,7 +1,7 @@
 //! 多文件顺序投递编排：只产出事件，不感知终端形态。
 //!
-//! 回执在发送 Completed 事件后立即确认清理：回执本身已持久化在 checkpoint，
-//! 即使消费端输出中断，重跑同一命令经服务端对账仍可再次取得。
+//! CLI 保留已完成 checkpoint 作为持久运单：重跑同一命令仍使用原对象 ID
+//! 对账回执，不会丢失幂等身份后新建或误报同名冲突。
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use waybill::{
@@ -60,144 +60,141 @@ pub(crate) struct Outcome {
     pub stopped: bool,
 }
 
-/// 顺序投递全部任务；事件发完（含 Done）后返回。
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run(
-    jobs: Vec<Job>,
-    sink: std::sync::Arc<dyn waybill::upload::UploadSink>,
-    store: FileCheckpointStore,
-    engine: UploadEngine,
-    stop: StopToken,
-    conflict: ConflictPolicy,
-    operation_override: Option<String>,
-    events: mpsc::UnboundedSender<Event>,
-) -> Outcome {
-    let instance = sink.identity().instance;
-    // 显式操作 ID 只对单文件队列有意义；多文件由调用方先行拒绝。
-    let single_operation = if jobs.len() == 1 {
-        operation_override
-    } else {
-        None
-    };
-    let mut receipts = 0;
-    let mut failures = 0;
-    let mut stopped = false;
-    for (index, job) in jobs.into_iter().enumerate() {
-        if stop.is_stopped() {
-            stopped = true;
-            break;
-        }
-        let outcome = deliver(
-            index,
-            &job,
-            sink.as_ref(),
-            &store,
-            &engine,
-            &stop,
-            conflict,
-            &instance,
-            single_operation.as_deref(),
-            &events,
-        )
-        .await;
-        match outcome {
-            Ok(()) => receipts += 1,
-            Err(Failure { message, kind }) => {
-                let _ = events.send(Event::Failed {
-                    index,
-                    name: job.name.clone(),
-                    message,
-                    paused: kind == ErrorKind::Paused,
-                });
-                failures += 1;
-                if kind == ErrorKind::Paused {
-                    // 用户请求停止：剩余文件保留为未开始状态。
-                    stopped = true;
-                    break;
-                }
-                if kind == ErrorKind::Authentication {
-                    // 凭证失效时继续尝试只会重复失败，交还用户重新登录。
-                    stopped = true;
-                    break;
+/// 编排资源由一个队列拥有，输出通过有界通道交付。
+pub(crate) struct Runner {
+    pub sink: std::sync::Arc<dyn waybill::upload::UploadSink>,
+    pub store: FileCheckpointStore,
+    pub engine: UploadEngine,
+    pub stop: StopToken,
+    pub conflict: ConflictPolicy,
+    pub events: mpsc::Sender<Event>,
+}
+
+impl Runner {
+    /// 顺序投递全部任务；事件发完（含 Done）后返回。
+    pub(crate) async fn run(self, jobs: Vec<Job>, operation_override: Option<String>) -> Outcome {
+        let mut receipts = 0;
+        let mut failures = 0;
+        let mut stopped = false;
+        for (index, job) in jobs.into_iter().enumerate() {
+            if self.stop.is_stopped() || self.events.is_closed() {
+                stopped = true;
+                break;
+            }
+            match self
+                .deliver(index, &job, operation_override.as_deref())
+                .await
+            {
+                Ok(()) => receipts += 1,
+                Err(Failure { message, kind }) => {
+                    let _ = self
+                        .events
+                        .send(Event::Failed {
+                            index,
+                            name: job.name.clone(),
+                            message,
+                            paused: kind == ErrorKind::Paused,
+                        })
+                        .await;
+                    failures += 1;
+                    if kind == ErrorKind::Paused {
+                        stopped = true;
+                        break;
+                    }
+                    if kind == ErrorKind::Authentication {
+                        // 凭证失败不是用户暂停；保留失败退出语义。
+                        break;
+                    }
                 }
             }
         }
+        let _ = self
+            .events
+            .send(Event::Done {
+                receipts,
+                failures,
+                stopped,
+            })
+            .await;
+        Outcome { failures, stopped }
     }
-    let _ = events.send(Event::Done {
-        receipts,
-        failures,
-        stopped,
-    });
-    Outcome { failures, stopped }
+
+    async fn deliver(
+        &self,
+        index: usize,
+        job: &Job,
+        operation_override: Option<&str>,
+    ) -> Result<(), Failure> {
+        let source = FileSource::open(&job.path).await.map_err(|e| failure(&e))?;
+        let identity = source.identity().await.map_err(|e| failure(&e))?;
+        let operation = operation_override.map(str::to_string).unwrap_or_else(|| {
+            derive_operation(
+                &self.sink.identity().instance,
+                &job.target,
+                &identity.blake3,
+            )
+        });
+        self.events
+            .send(Event::Started {
+                index,
+                name: job.name.clone(),
+                target: job.target.clone(),
+                size: identity.size,
+                operation: operation.clone(),
+            })
+            .await
+            .map_err(|_| output_closed())?;
+        let receipt = self
+            .engine
+            .run(
+                &source,
+                self.sink.as_ref(),
+                &self.store,
+                RunOptions {
+                    intent: UploadIntent {
+                        operation,
+                        target: job.target.clone(),
+                        conflict: self.conflict,
+                    },
+                    policy: Default::default(),
+                    stop: &self.stop,
+                    progress: &|p| {
+                        // 同步回调不能等待；进度可合并，生命周期事件则必须交付。
+                        if let Err(mpsc::error::TrySendError::Closed(_)) =
+                            self.events.try_send(Event::Progress {
+                                index,
+                                persisted: p.persisted,
+                                sent: p.sent,
+                                total: p.total,
+                                epoch: p.epoch,
+                                complete: p.complete,
+                            })
+                        {
+                            self.stop.stop();
+                        }
+                    },
+                },
+            )
+            .await
+            .map_err(|e| failure(&e))?;
+        self.events
+            .send(Event::Completed { index, receipt })
+            .await
+            .map_err(|_| output_closed())?;
+        Ok(())
+    }
+}
+
+fn output_closed() -> Failure {
+    Failure {
+        message: "output closed; rerun the same command to resume".into(),
+        kind: ErrorKind::Paused,
+    }
 }
 
 struct Failure {
     message: String,
     kind: ErrorKind,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn deliver(
-    index: usize,
-    job: &Job,
-    sink: &dyn waybill::upload::UploadSink,
-    store: &FileCheckpointStore,
-    engine: &UploadEngine,
-    stop: &StopToken,
-    conflict: ConflictPolicy,
-    instance: &str,
-    operation_override: Option<&str>,
-    events: &mpsc::UnboundedSender<Event>,
-) -> Result<(), Failure> {
-    let source = FileSource::open(&job.path).await.map_err(|e| failure(&e))?;
-    let identity = source.identity().await.map_err(|e| failure(&e))?;
-    let operation = operation_override
-        .map(str::to_string)
-        .unwrap_or_else(|| derive_operation(instance, &job.target, &identity.blake3));
-    let _ = events.send(Event::Started {
-        index,
-        name: job.name.clone(),
-        target: job.target.clone(),
-        size: identity.size,
-        operation: operation.clone(),
-    });
-    let tx = events.clone();
-    let receipt = engine
-        .run(
-            &source,
-            sink,
-            store,
-            RunOptions {
-                intent: UploadIntent {
-                    operation,
-                    target: job.target.clone(),
-                    conflict,
-                },
-                policy: Default::default(),
-                stop,
-                progress: &move |p| {
-                    let _ = tx.send(Event::Progress {
-                        index,
-                        persisted: p.persisted,
-                        sent: p.sent,
-                        total: p.total,
-                        epoch: p.epoch,
-                        complete: p.complete,
-                    });
-                },
-            },
-        )
-        .await
-        .map_err(|e| failure(&e))?;
-    let _ = events.send(Event::Completed {
-        index,
-        receipt: receipt.clone(),
-    });
-    engine
-        .confirm(store, &receipt)
-        .await
-        .map_err(|e| failure(&e))?;
-    Ok(())
 }
 
 fn failure(error: &waybill::error::Error) -> Failure {
@@ -240,5 +237,186 @@ mod tests {
             derive_operation("other", "backup/a.iso", &"0".repeat(64))
         );
         assert!(a.starts_with("wb-") && a.len() == 19);
+    }
+
+    use super::{Event, Job, Runner};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use waybill::{
+        BoxFuture,
+        budget::ResourceBudget,
+        checkpoint::DriverState,
+        error::{Error, ErrorKind},
+        service::{Capabilities, ServiceId, ServiceIdentity},
+        source::SourceIdentity,
+        upload::{
+            ConflictPolicy, Receipt, SessionStatus, StopToken, UploadEngine, UploadIntent,
+            UploadSink,
+        },
+    };
+    use waybill_service_fs::FileCheckpointStore;
+
+    struct CompletedSink {
+        prepares: AtomicUsize,
+        authentication_failure: bool,
+    }
+
+    impl UploadSink for CompletedSink {
+        fn identity(&self) -> ServiceIdentity {
+            ServiceIdentity {
+                service: ServiceId::parse("test:drive").unwrap(),
+                instance: "account".into(),
+            }
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                offset_upload: true,
+                durable_upload: true,
+                ..Default::default()
+            }
+        }
+        fn prepare<'a>(
+            &'a self,
+            _: &'a UploadIntent,
+            _: &'a SourceIdentity,
+        ) -> BoxFuture<'a, DriverState> {
+            Box::pin(async move {
+                self.prepares.fetch_add(1, Ordering::Relaxed);
+                if self.authentication_failure {
+                    Err(Error::new(ErrorKind::Authentication, "reconnect"))
+                } else {
+                    Ok(DriverState {
+                        version: 1,
+                        payload: vec![1],
+                    })
+                }
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            intent: &'a UploadIntent,
+            source: &'a SourceIdentity,
+            state: &'a DriverState,
+        ) -> BoxFuture<'a, SessionStatus> {
+            Box::pin(async move {
+                Ok(SessionStatus::Complete {
+                    state: state.clone(),
+                    receipt: Receipt {
+                        operation: intent.operation.clone(),
+                        service: self.identity(),
+                        target: intent.target.clone(),
+                        object: "original-object".into(),
+                        size: source.size,
+                    },
+                })
+            })
+        }
+        fn initialize<'a>(
+            &'a self,
+            _: &'a UploadIntent,
+            _: &'a SourceIdentity,
+            _: &'a DriverState,
+        ) -> BoxFuture<'a, SessionStatus> {
+            Box::pin(async { panic!("completed upload must not initialize") })
+        }
+        fn write_chunk<'a>(
+            &'a self,
+            _: &'a UploadIntent,
+            _: &'a SourceIdentity,
+            _: &'a DriverState,
+            _: u64,
+            _: Vec<u8>,
+        ) -> BoxFuture<'a, SessionStatus> {
+            Box::pin(async { panic!("completed upload must not retransmit") })
+        }
+    }
+
+    async fn queue(
+        sink: Arc<CompletedSink>,
+        dir: &std::path::Path,
+        stop: StopToken,
+    ) -> (super::Outcome, Vec<Event>) {
+        let (events, mut receiver) = tokio::sync::mpsc::channel(64);
+        let runner = Runner {
+            sink,
+            store: FileCheckpointStore::new(dir.join("checkpoints")),
+            engine: UploadEngine::new(Arc::new(ResourceBudget::default())),
+            stop,
+            conflict: ConflictPolicy::Reject,
+            events,
+        };
+        let outcome = runner
+            .run(
+                vec![Job {
+                    path: dir.join("source"),
+                    name: "source".into(),
+                    target: "target".into(),
+                }],
+                None,
+            )
+            .await;
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        (outcome, events)
+    }
+
+    #[tokio::test]
+    async fn repeated_put_keeps_completed_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source"), b"content").unwrap();
+        let sink = Arc::new(CompletedSink {
+            prepares: AtomicUsize::new(0),
+            authentication_failure: false,
+        });
+        for _ in 0..2 {
+            let (outcome, events) = queue(sink.clone(), dir.path(), StopToken::default()).await;
+            assert_eq!(outcome.failures, 0);
+            assert!(events.iter().any(|event| matches!(event, Event::Completed { receipt, .. } if receipt.object == "original-object")));
+        }
+        assert_eq!(sink.prepares.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_before_first_file_is_not_successful_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CompletedSink {
+            prepares: AtomicUsize::new(0),
+            authentication_failure: false,
+        });
+        let stop = StopToken::default();
+        stop.stop();
+        let (outcome, events) = queue(sink.clone(), dir.path(), stop).await;
+        assert!(outcome.stopped);
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Done {
+                receipts: 0,
+                failures: 0,
+                stopped: true
+            }]
+        ));
+        assert_eq!(sink.prepares.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_is_not_user_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source"), b"content").unwrap();
+        let sink = Arc::new(CompletedSink {
+            prepares: AtomicUsize::new(0),
+            authentication_failure: true,
+        });
+        let (outcome, events) = queue(sink, dir.path(), StopToken::default()).await;
+        assert_eq!(outcome.failures, 1);
+        assert!(!outcome.stopped);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Failed { paused: false, .. }))
+        );
     }
 }

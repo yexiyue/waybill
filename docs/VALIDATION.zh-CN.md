@@ -68,6 +68,39 @@ checkpoint 和对象 ID 保存在仓库外的私有目录；本记录不包含�
 在协议替身中通过。真实授权拒绝、限流、回执磁盘失败及嵌套目录故障也未主动在
 Google 环境制造；不得将替身结果标为真机通过。
 
+## wb CLI 审查与真机流程（2026-10-01）
+
+本轮审查基线为 `6e7bd3391d77065f69a509cdc782af7995305f15..23f04a2`（最近五次提交）。
+规范与需求分轴审查后，修复邮箱字段映射、默认 root 可见性、完成记录幂等、停止退出码、
+JSON 实时刷新、事件／记录资源上界和 TUI 键位行为。CLI 按实际 Google permissionId
+隔离 service 实例，凭证应用与 token 原子保存；两份 README 和设计文档同步行为。
+
+环境为本机 macOS / arm64、debug `wb`、用户提供的仓库外 desktop OAuth 配置。
+先以 `drive.file` 完成登录、上传及恢复验证；随后按用户授权增加 `drive.readonly` 并重新
+登录，验证根目录 metadata 与云盘列表可读。列表选择和下载命令尚未实现；验收下载
+使用独立只读 HTTP 客户端。
+
+| 场景 | 实际结果 |
+|---|---|
+| 浏览器登录 | 默认自动识别邮箱；login 参数支持 provider 前后两种位置；`--json` stdout 仅一个 JSON 记录 |
+| 多文件与空文件 | 文本与空文件顺序上传；默认 My Drive 根目录下创建独立验收目录 |
+| 重复投递 | 多文件、64 MiB 文件与操作后缀投递重复运行均返回同一对象；目录清单无重复对象 |
+| 暂停与恢复 | 64 MiB 文件在首块持久确认后 SIGINT，退出 130；status 显示在途；新进程从 8 MiB 继续 |
+| 强制进程中断 | 首块持久确认后 SIGKILL；重跑从已确认区间继续完成 |
+| 内容校验 | 独立下载文本、空文件与 64 MiB 文件；SHA-256 与本地一致 |
+| 冲突策略与参数 | 默认冲突失败；显式 operation-suffix 成功且重跑幂等；显式根目录、操作 ID 和无效参数分支通过 |
+| token 刷新 | 将本机测试凭证期限设为过期；真实刷新后继续投递，generation 增加并持久保存 |
+| 全屏面板 | 控制 PTY 中详情／Esc／完成后 q 退出为 0；上传中连续两次 q 立即退出为 130，重跑恢复完成 |
+
+原始 CLI 事件、脚本和摘要在本机 `~/Library/Application Support/waybill/cli-acceptance-20261001/`，
+凭证与 checkpoint 保留在 CLI 私有状态目录；不将 token、session URI 或私有 payload
+录入本文件。验收对象与测试记录保留，没有删除用户文件或运行远端 CI。
+
+本轮工作区普通测试共 46 项（CLI 21、GDrive 18、core 3、fs 3、只读消费者 1）；
+两个 ignored 子进程辅助入口仍由父测试明确执行。fmt、workspace all-targets check、
+Clippy `-D warnings`、workspace test 和 rustdoc `-D warnings` 在本机通过。
+本轮未重新执行 Linux 验证、真实会话自然过期或服务端故障注入，不扩大原有平台结论。
+
 ## 资源样本
 
 环境为上述 macOS / arm64、debug 构建、单路上传、Google Drive、当时本机网络；

@@ -107,6 +107,21 @@ OpenDAL 适配器由实际额外后端需求触发，优先验证下载：范围
 文件与 Drive 交付实现提供初始素材；waybill 的公共契约独立于应用 UI、设备身份
 和 P2P 协议。
 
+## 使用 wb
+
+```sh
+cargo run -p waybill-cli -- login gdrive --client /path/to/desktop.json
+cargo run -p waybill-cli -- put ./file.zip 'gdrive://account@example.com/backup/'
+cargo run -p waybill-cli -- status
+```
+
+授权包含 `drive.file`（上传本应用文件）和 `drive.readonly`（读取云盘文件）；
+文件列表与下载仍待后续实现。登录默认用 Google 邮箱作为账户名，可用 `--account` 指定别名。多文件投递的目标
+以 `/` 结尾；目录必须由该应用创建，或显式指定应用可访问的 `--root <目录 ID>`。
+TTY 默认显示全屏面板，`--no-tui` 使用行式输出，`--json` 输出实时 JSON 事件。
+Ctrl-C 首次优雅停止、再次立即中止；重跑同一命令续传或复用完成回执。
+完成记录保存在本机，`status` 同时显示在途与已完成记录；删除记录后不保证幂等跳过。
+
 ## 认识 Bill · 雁哥
 
 <p align="center">

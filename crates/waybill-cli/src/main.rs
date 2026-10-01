@@ -4,6 +4,7 @@
 //! 核心与 service 不反向依赖本 crate。凭证与会话细节不进入输出。
 mod cli;
 mod cmd;
+mod credentials;
 mod error;
 mod gdrive_host;
 mod oauth;

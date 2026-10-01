@@ -20,18 +20,28 @@ impl Gdrive {
                 "Drive directory depth bound",
             ));
         }
-        let root = self
-            .api
-            .get_file(&self.config.root)
-            .await?
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Drive root unavailable"))?;
-        if root.mime_type != "application/vnd.google-apps.folder" {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Drive root is not a folder",
-            ));
-        }
-        let mut parent = root.id;
+        let mut parent = if self.config.root == "root" {
+            self.api.root_folder_id().await?
+        } else {
+            let root = self
+                .api
+                .get_file(&self.config.root)
+                .await?
+                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Drive root unavailable"))?;
+            if root.mime_type != "application/vnd.google-apps.folder" {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Drive root is not a folder",
+                ));
+            }
+            if root.id != self.config.root {
+                return Err(Error::new(
+                    ErrorKind::IdentityMismatch,
+                    "Drive root identity changed",
+                ));
+            }
+            root.id
+        };
         let mut directories = Vec::new();
         let mut parent_exists = true;
         for name in parts {

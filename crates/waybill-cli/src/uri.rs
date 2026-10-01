@@ -3,6 +3,7 @@
 //! 不用 url crate 解析：账户通常是电子邮件，`@` 会被误拆成 userinfo/host。
 //! 路径按字面使用，不做百分号解码；shell 引号已覆盖转义需求。
 use waybill::error::{Error, ErrorKind, Result};
+use waybill::upload::{ConflictPolicy, UploadIntent};
 
 const SCHEME: &str = "gdrive://";
 
@@ -23,14 +24,17 @@ impl Destination {
         if !self.directory {
             return Err(invalid());
         }
-        if self.target.is_empty() {
-            return Ok(file_name.to_string());
-        }
-        Ok(format!("{}/{}", self.target, file_name))
+        let target = if self.target.is_empty() {
+            file_name.to_string()
+        } else {
+            format!("{}/{}", self.target, file_name)
+        };
+        validate_target(&target)?;
+        Ok(target)
     }
 }
 
-/// 解析并做结构校验；路径段的语义规则由引擎的 UploadIntent::validate 复核。
+/// 解析并复用公开上传契约校验路径，在读取凭证之前拒绝无效目标。
 pub fn parse(uri: &str) -> Result<Destination> {
     let rest = uri.strip_prefix(SCHEME).ok_or_else(invalid)?;
     let (account, path) = rest.split_once('/').ok_or_else(invalid)?;
@@ -43,6 +47,9 @@ pub fn parse(uri: &str) -> Result<Destination> {
     if !directory && target.is_empty() {
         return Err(invalid());
     }
+    if !target.is_empty() {
+        validate_target(&target)?;
+    }
     Ok(Destination {
         account: account.to_string(),
         target,
@@ -53,12 +60,22 @@ pub fn parse(uri: &str) -> Result<Destination> {
 /// 账户会同时作为凭证目录名：拒绝路径分量与控制字符，其余（含 `@`）放行。
 pub fn safe_account(account: &str) -> bool {
     !account.is_empty()
-        && account.len() <= 256
+        && account.len() <= 255
         && account != "."
         && account != ".."
         && account
             .chars()
             .all(|c| !c.is_control() && c != '\\' && c != '/')
+}
+
+fn validate_target(target: &str) -> Result<()> {
+    UploadIntent {
+        operation: "uri-validation".into(),
+        target: target.into(),
+        conflict: ConflictPolicy::Reject,
+    }
+    .validate()
+    .map_err(|_| invalid())
 }
 
 fn invalid() -> Error {
@@ -102,6 +119,9 @@ mod tests {
             "gdrive://me@gmail.com/backup//a",
             "gdrive:///backup/",
             "gdrive://../backup/",
+            "gdrive://me@gmail.com/../backup/",
+            "gdrive://me@gmail.com/backup/./a",
+            "gdrive://me@gmail.com/backup\\a",
         ] {
             assert_eq!(
                 parse(uri).unwrap_err().kind,
@@ -109,5 +129,14 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_invalid_names_and_filesystem_component_overflow() {
+        assert!(!safe_account(&"a".repeat(256)));
+        assert!(safe_account(&"a".repeat(255)));
+        let dest = parse("gdrive://me@gmail.com/backup/").unwrap();
+        assert!(dest.join(&"a".repeat(256)).is_err());
+        assert!(dest.join("..").is_err());
     }
 }

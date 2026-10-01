@@ -1,5 +1,5 @@
 //! `wb login`：浏览器授权并把应用身份与 token 存入本机私有目录。
-use crate::{cli::Provider, error::CliError, oauth, paths::Layout, uri};
+use crate::{cli::Provider, credentials::Credentials, error::CliError, oauth, paths::Layout, uri};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -11,6 +11,11 @@ pub async fn run(
     json: bool,
 ) -> Result<(), CliError> {
     let Provider::Gdrive = provider;
+    if let Some(account) = &account_override
+        && !uri::safe_account(account)
+    {
+        return Err(CliError::Message("账户名不能用作目录名".into()));
+    }
     let client_path = client
         .or_else(|| std::env::var_os("WAYBILL_GDRIVE_CLIENT").map(PathBuf::from))
         .ok_or_else(|| {
@@ -32,14 +37,13 @@ pub async fn run(
         )));
     }
     let dir = Layout::discover()?.gdrive_account(&account);
-    // 先存应用身份再存 token：中断后最多缺 token，重跑登录即可修复。
-    oauth::save_private(&dir.join("app.json"), &app)?;
-    oauth::save_private(&dir.join("token.json"), &token)?;
+    Credentials { app, token }.save(&dir)?;
     if json {
         println!("{}", json!({ "provider": "gdrive", "account": account }));
     } else {
         println!("已登录 gdrive：{account}");
         println!("凭证保存在本机私有目录：{}", dir.display());
+        println!("开始投递：wb put <文件> gdrive://{account}/<目录>/");
     }
     Ok(())
 }
