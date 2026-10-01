@@ -1,4 +1,4 @@
-//! 衍生于 SwarmDrop DriveClient，MIT；错误只保留安全的静态上下文。
+//! 错误只保留安全的静态上下文。
 use crate::{
     credential::TokenProvider,
     object::{DriveFile, FILE_FIELDS, FileList, validate_id},
@@ -54,7 +54,7 @@ impl DriveClient {
     pub(crate) async fn request(
         &self,
         request: reqwest::RequestBuilder,
-        retry_safe: bool,
+        idempotent: bool,
     ) -> Result<Response> {
         let mut token = self
             .credentials
@@ -85,7 +85,7 @@ impl DriveClient {
                     if response.status() == StatusCode::TOO_MANY_REQUESTS
                         || response.status().is_server_error() =>
                 {
-                    if !retry_safe || attempt >= 3 {
+                    if !idempotent || attempt >= 3 {
                         return Err(Error::new(ErrorKind::Retryable, "Drive transient response"));
                     }
                     let seconds = response
@@ -118,14 +118,14 @@ impl DriveClient {
                             "Drive permission denied",
                         ));
                     }
-                    if !retry_safe || attempt >= 3 {
+                    if !idempotent || attempt >= 3 {
                         return Err(Error::new(ErrorKind::Retryable, "Drive rate limited"));
                     }
                     self.delay(1 << attempt).await;
                     attempt += 1;
                 }
                 Ok(response) => return Ok(response),
-                Err(_) if retry_safe && attempt < 3 => {
+                Err(_) if idempotent && attempt < 3 => {
                     self.delay(1 << attempt).await;
                     attempt += 1;
                 }

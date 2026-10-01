@@ -2,12 +2,10 @@
 use std::{sync::Arc, time::Duration};
 use waybill::{
     BoxFuture,
+    budget::ResourceBudget,
     error::{Error, ErrorKind},
     service::Service,
-    upload::{
-        ConflictPolicy, ResourceBudget, RunOptions, StopToken, UploadEngine, UploadIntent,
-        UploadPolicy,
-    },
+    upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent, UploadPolicy},
 };
 use waybill_service_fs::{FileCheckpointStore, FsService};
 use waybill_service_gdrive::{

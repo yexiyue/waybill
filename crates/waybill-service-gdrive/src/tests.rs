@@ -16,13 +16,11 @@ use tokio::{
 };
 use waybill::{
     BoxFuture,
+    budget::ResourceBudget,
     checkpoint::{Checkpoint, CheckpointLease, CheckpointStore},
     error::{Error, ErrorKind},
     source::Source,
-    upload::{
-        ConflictPolicy, ResourceBudget, RunOptions, StopToken, UploadEngine, UploadIntent,
-        UploadPolicy,
-    },
+    upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent, UploadPolicy},
 };
 use waybill_service_fs::{FileCheckpointStore, FileSource};
 struct Tokens {

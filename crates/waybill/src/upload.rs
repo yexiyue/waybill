@@ -1,6 +1,7 @@
 //! 上传状态机：远端对账先于继续发送，完成回执先于成功返回。
 use crate::{
     BoxFuture,
+    budget::ResourceBudget,
     checkpoint::{Checkpoint, CheckpointStore, DriverState, FORMAT_VERSION},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
@@ -9,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 /// 目标冲突策略；不同进程对同名对象不具备跨进程原子隔离。
@@ -34,26 +35,38 @@ pub struct UploadIntent {
 impl UploadIntent {
     /// 校验有界操作标识和目标路径。
     pub fn validate(&self) -> Result<()> {
-        if self.operation.is_empty()
-            || self.operation.len() > 128
-            || !self
-                .operation
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
-            || self.target.is_empty()
-            || self.target.len() > 4096
-            || self.target.split('/').any(|p| {
-                p.is_empty()
-                    || p == "."
-                    || p == ".."
-                    || p.len() > 255
-                    || p.chars().any(|c| c.is_control() || c == '\\')
-            })
-        {
+        if !valid_operation(&self.operation) || !valid_target(&self.target) {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid upload intent"));
         }
         Ok(())
     }
+}
+/// 操作标识：1..=128 字节的 ASCII 字母数字与 `-_.:`。
+fn valid_operation(operation: &str) -> bool {
+    !operation.is_empty()
+        && operation.len() <= 128
+        && operation
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+}
+/// 目标路径：段非空且不含 `.`、`..`、反斜杠或控制字符。
+fn valid_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.len() <= 4096
+        && target.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment.len() <= 255
+                && !segment.chars().any(|c| c.is_control() || c == '\\')
+        })
+}
+/// BLAKE3 小写十六进制摘要（64 字符）。
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 /// 持久完成证据；消费者记账后以同一回执确认清理。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,9 +164,8 @@ pub struct UploadPolicy {
 pub struct Progress {
     /// 本次运行尝试发送字节数，可因重传超过文件长度。
     pub sent: u64,
-    /// 最近服务端确认字节数，可在对账时回退。
-    pub acknowledged: u64,
-    /// 已持久记录的确认字节数。
+    /// 已持久化的服务端确认字节数；引擎只在 checkpoint 落盘后上报，
+    /// 对账回退时此值可以变小。
     pub persisted: u64,
     /// 源长度。
     pub total: u64,
@@ -172,59 +184,6 @@ pub struct RunOptions<'a> {
     pub stop: &'a StopToken,
     /// 有界同步通知；回调不能阻塞或保存数据缓冲。
     pub progress: &'a (dyn Fn(Progress) + Send + Sync),
-}
-/// 多个引擎共享的资源门禁。繁忙返回 ResourceBusy，宿主负责等待策略。
-pub struct ResourceBudget {
-    chunk_size: usize,
-    active: AtomicUsize,
-    concurrency: usize,
-}
-impl Default for ResourceBudget {
-    fn default() -> Self {
-        Self {
-            chunk_size: 8 * 1024 * 1024,
-            active: AtomicUsize::new(0),
-            concurrency: 2,
-        }
-    }
-}
-impl ResourceBudget {
-    /// 块为 256 KiB 的倍数且不超过 8 MiB，并发不超过 2。
-    pub fn new(chunk_size: usize, concurrency: usize) -> Result<Self> {
-        if chunk_size == 0
-            || chunk_size > 8 * 1024 * 1024
-            || chunk_size % (256 * 1024) != 0
-            || !(1..=2).contains(&concurrency)
-        {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "invalid resource budget",
-            ));
-        }
-        Ok(Self {
-            chunk_size,
-            concurrency,
-            active: AtomicUsize::new(0),
-        })
-    }
-    /// 共享上传数据缓冲的最大字节数，不包括有界校验 / 元数据开销。
-    pub fn max_data_bytes(&self) -> usize {
-        self.chunk_size * self.concurrency
-    }
-    fn acquire(self: &Arc<Self>) -> Result<Permit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.concurrency).then_some(n + 1)
-            })
-            .map_err(|_| Error::new(ErrorKind::ResourceBusy, "upload budget exhausted"))?;
-        Ok(Permit(self.clone()))
-    }
-}
-struct Permit(Arc<ResourceBudget>);
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 /// 只依赖公开端口的上传引擎。
 pub struct UploadEngine {
@@ -263,12 +222,7 @@ impl UploadEngine {
             return Err(Error::new(ErrorKind::Paused, "upload paused"));
         }
         let identity = source.identity().await?;
-        if identity.blake3.len() != 64
-            || !identity
-                .blake3
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !valid_digest(&identity.blake3) {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid source digest"));
         }
         let mut checkpoint = match lease.load().await? {
@@ -416,7 +370,7 @@ impl UploadEngine {
                         ));
                     }
                     let length = (checkpoint.source.size - offset)
-                        .min(self.budget.chunk_size as u64)
+                        .min(self.budget.chunk_size() as u64)
                         as usize;
                     let data = source.read_range(offset, length).await?;
                     if data.len() != length {
@@ -500,7 +454,6 @@ impl UploadEngine {
 fn report(checkpoint: &Checkpoint, sent: u64, progress: &(dyn Fn(Progress) + Send + Sync)) {
     progress(Progress {
         sent,
-        acknowledged: checkpoint.acknowledged,
         persisted: checkpoint.acknowledged,
         total: checkpoint.source.size,
         epoch: checkpoint.restarts,

@@ -19,13 +19,14 @@ use tokio::{
 };
 use waybill::{
     BoxFuture,
+    budget::ResourceBudget,
     checkpoint::DriverState,
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
     source::{Source, SourceIdentity},
     upload::{
-        ConflictPolicy, ResourceBudget, RunOptions, SessionStatus, StopToken, UploadEngine,
-        UploadIntent, UploadPolicy, UploadSink,
+        ConflictPolicy, RunOptions, SessionStatus, StopToken, UploadEngine, UploadIntent,
+        UploadPolicy, UploadSink,
     },
 };
 use waybill_service_fs::{FileCheckpointStore, FileSource};

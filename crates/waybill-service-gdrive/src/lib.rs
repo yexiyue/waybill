@@ -1,6 +1,5 @@
 //! Google Drive 上传恢复 service；OAuth 授权和秘密存储属于宿主。
 //!
-//! 协议与持久恢复编排衍生于 SwarmDrop（MIT），来源见仓库 THIRD_PARTY_NOTICES.md。
 //! 不支持下载、跨操作内容去重或通用原子发布。生产端点仅允许 Google HTTPS。
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

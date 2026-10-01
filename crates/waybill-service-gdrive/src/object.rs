@@ -1,4 +1,4 @@
-//! 衍生于 SwarmDrop object.rs，MIT；仅保留通用操作属性。
+//! 仅保留通用操作属性。
 use crate::{Gdrive, client::protocol};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -1,4 +1,3 @@
-//! 衍生于 SwarmDrop persistence.rs，Copyright (c) 2026 SwarmDrop Contributors，MIT。
 //! 权限、同步与进程锁属于原生存储；锁文件不删除，避免锁 inode 被替换。
 use std::{
     fs::{File, OpenOptions},

@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod budget;
 pub mod checkpoint;
 pub mod error;
 pub mod service;

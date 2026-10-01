@@ -1,4 +1,4 @@
-//! 衍生于 SwarmDrop upload.rs，MIT；核心拥有持久化和过期重建决策。
+//! 核心拥有持久化和过期重建决策。
 use crate::{
     Gdrive,
     client::{ensure_success, protocol, read_json},

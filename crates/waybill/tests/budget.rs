@@ -6,13 +6,14 @@ use std::{
 };
 use waybill::{
     BoxFuture,
+    budget::ResourceBudget,
     checkpoint::{Checkpoint, CheckpointLease, CheckpointStore, DriverState},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceId, ServiceIdentity},
     source::{Source, SourceIdentity},
     upload::{
-        ConflictPolicy, ResourceBudget, RunOptions, SessionStatus, StopToken, UploadEngine,
-        UploadIntent, UploadPolicy, UploadSink,
+        ConflictPolicy, RunOptions, SessionStatus, StopToken, UploadEngine, UploadIntent,
+        UploadPolicy, UploadSink,
     },
 };
 struct Pending;
@@ -124,10 +125,12 @@ fn shared_budget_rejects_overcommit_and_releases_on_future_drop() {
     assert!(third.as_mut().poll(&mut context).is_pending());
 }
 #[test]
-fn oversized_or_unaligned_budgets_are_rejected() {
-    assert!(ResourceBudget::new(9 * 1024 * 1024, 2).is_err());
-    assert!(ResourceBudget::new(256 * 1024, 3).is_err());
-    assert!(ResourceBudget::new(1, 1).is_err());
+fn budget_bounds_are_enforced_at_the_core_level() {
+    // 核心只约束共享内存上界；块对齐等后端形状约束由各 service 校验。
+    assert!(ResourceBudget::new(0, 1).is_err());
+    assert!(ResourceBudget::new(32 * 1024 * 1024 + 1, 2).is_err());
+    assert!(ResourceBudget::new(256 * 1024, 17).is_err());
+    assert!(ResourceBudget::new(32 * 1024 * 1024, 16).is_ok());
 }
 #[test]
 fn namespace_identifiers_are_open_and_validated() -> Result<()> {
@@ -136,5 +139,8 @@ fn namespace_identifiers_are_open_and_validated() -> Result<()> {
         "third-party:cloud-storage"
     );
     assert!(ServiceId::parse("no-namespace").is_err());
+    // FromStr 是惯用入口，与 parse / serde 同一校验。
+    assert!("waybill:fs".parse::<ServiceId>().is_ok());
+    assert!("bad".parse::<ServiceId>().is_err());
     Ok(())
 }
