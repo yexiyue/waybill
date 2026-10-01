@@ -69,7 +69,9 @@ bindings.
 The full design — motivation, ecosystem survey, API sketches, the open
 extension contract for third-party services — lives in
 [docs/DESIGN.zh-CN.md](docs/DESIGN.zh-CN.md) (Chinese, English translation
-welcome as a contribution).
+welcome as a contribution). The CLI market scan — why this doesn't fight
+rclone head-on — lives in
+[docs/market-cli.zh-CN.md](docs/market-cli.zh-CN.md).
 
 ## Bill, the courier goose
 
