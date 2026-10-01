@@ -1,22 +1,13 @@
 //! 文件选择器：ratatui 渲染与 crossterm 输入；网络和目录读取由宿主拥有。
 use crate::error::CliError;
-use ratatui_kit::{
-    crossterm::{
-        self,
-        event::{self, KeyCode, KeyEventKind, KeyModifiers},
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-    },
+use std::collections::BTreeSet;
+use {
+    crossterm::event::{self, KeyCode, KeyEventKind, KeyModifiers},
     ratatui::{
-        self,
-        backend::CrosstermBackend,
         layout::{Constraint, Layout},
         style::{Color, Style},
         widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     },
-};
-use std::{
-    collections::BTreeSet,
-    io::{self, IsTerminal},
 };
 
 pub struct Row {
@@ -34,36 +25,20 @@ pub struct Pick {
     pub action: Action,
     pub marked: BTreeSet<usize>,
 }
-struct TerminalGuard;
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(io::stderr(), LeaveAlternateScreen, crossterm::cursor::Show);
-    }
-}
 pub fn require_interactive(json: bool, no_tui: bool) -> Result<(), CliError> {
-    if json
-        || no_tui
-        || !io::stdin().is_terminal()
-        || !io::stdout().is_terminal()
-        || !io::stderr().is_terminal()
-    {
+    if json || no_tui || !super::interactive_terminal() {
         return Err(CliError::Message(
             "参数不完整；交互需要终端。请指定路径、目标和 --drive（或先配置默认盘）".into(),
         ));
     }
     Ok(())
 }
-pub async fn choose(title: String, rows: Vec<Row>, help: &'static str) -> Result<Pick, CliError> {
-    tokio::task::spawn_blocking(move || draw(title, rows, help))
-        .await
-        .map_err(|error| CliError::Message(format!("选择器异常退出：{error}")))?
-}
-fn draw(title: String, rows: Vec<Row>, help: &str) -> Result<Pick, CliError> {
-    crossterm::terminal::enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    crossterm::execute!(io::stderr(), EnterAlternateScreen)?;
-    let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(io::stderr()))?;
+pub async fn choose(
+    ui: &mut super::Session,
+    title: String,
+    rows: Vec<Row>,
+    help: &'static str,
+) -> Result<Pick, CliError> {
     let mut cursor = 0;
     let mut marked: BTreeSet<usize> = rows
         .iter()
@@ -76,7 +51,7 @@ fn draw(title: String, rows: Vec<Row>, help: &str) -> Result<Pick, CliError> {
         } else {
             String::new()
         };
-        terminal.draw(|frame| {
+        ui.draw(|frame| {
             let areas =
                 Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(frame.area());
             let items: Vec<_> = rows
@@ -106,7 +81,7 @@ fn draw(title: String, rows: Vec<Row>, help: &str) -> Result<Pick, CliError> {
             frame.render_stateful_widget(list, areas[0], &mut state);
             frame.render_widget(Paragraph::new(help), areas[1]);
         })?;
-        let event::Event::Key(key) = event::read()? else {
+        let event::Event::Key(key) = ui.next().await? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {

@@ -20,7 +20,8 @@ use waybill::{
     checkpoint::{Checkpoint, CheckpointLease, CheckpointStore, Flow},
     error::{Error, ErrorKind},
     source::Source,
-    upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent, UploadPolicy},
+    transfer::{ConflictPolicy, StopToken, TransferEngine},
+    upload::{UploadIntent, UploadOptions, UploadPolicy},
 };
 use waybill_service_fs::{FileCheckpointStore, FileSource};
 struct Tokens {
@@ -305,8 +306,8 @@ fn initialize(server: &Server) -> Vec<Reply> {
 fn object(drive: &Gdrive, identity: &waybill::source::SourceIdentity) -> serde_json::Value {
     json!({"id":"object-1","name":"payload.bin","size":identity.size.to_string(),"parents":["folder-1"],"appProperties":drive.properties(&intent(),identity)})
 }
-fn engine() -> UploadEngine {
-    UploadEngine::new(Arc::new(ResourceBudget::new(256 * 1024, 2).unwrap()))
+fn engine(store: impl CheckpointStore + 'static) -> TransferEngine {
+    TransferEngine::new(store).with_budget(Arc::new(ResourceBudget::new(256 * 1024, 2).unwrap()))
 }
 async fn source(dir: &tempfile::TempDir, size: usize) -> FileSource {
     let path = dir.path().join("source.bin");
@@ -335,20 +336,19 @@ async fn pause_restart_reconciles_server_ahead_and_retains_receipt_until_confirm
         .range("bytes 0-262143/307200"),
     ]);
     let stop = StopToken::default();
-    let result = engine()
-        .run(
+    let result = engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &stop,
-                progress: &|p| {
+                stop: stop.clone(),
+                progress: Some(&|p| {
                     if p.persisted == 262144 {
                         stop.stop();
                     }
-                },
+                }),
             },
         )
         .await;
@@ -383,20 +383,20 @@ async fn pause_restart_reconciles_server_ahead_and_retains_receipt_until_confirm
     let fresh_source = FileSource::open(dir.path().join("source.bin"))
         .await
         .unwrap();
-    let receipt = engine()
-        .run(
+    let receipt = engine(store.clone())
+        .upload(
             &fresh_source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
         .unwrap();
+    assert_eq!(receipt.verified, waybill::content::Verification::Length);
     let lease = store.acquire("operation-1").await.unwrap();
     assert_eq!(
         lease
@@ -417,23 +417,22 @@ async fn pause_restart_reconciles_server_ahead_and_retains_receipt_until_confirm
         object(&drive, &identity),
     )]);
     assert_eq!(
-        engine()
-            .run(
+        engine(store.clone())
+            .upload(
                 &fresh_source,
                 &drive,
-                &store,
-                RunOptions {
+                UploadOptions {
                     intent: intent(),
                     policy: UploadPolicy::default(),
-                    stop: &StopToken::default(),
-                    progress: &|_| {}
+                    stop: StopToken::default(),
+                    progress: Some(&|_| {})
                 }
             )
             .await
             .unwrap(),
         receipt
     );
-    engine().confirm(&store, &receipt).await.unwrap();
+    engine(store.clone()).confirm(&receipt).await.unwrap();
     assert!(
         store
             .acquire("operation-1")
@@ -472,16 +471,15 @@ async fn lost_completion_response_is_reconciled_without_duplicate_creation() {
             object(&drive, &identity),
         ),
     ]);
-    let receipt = engine()
-        .run(
+    let receipt = engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
@@ -510,7 +508,7 @@ async fn expiration_requires_explicit_restart_and_reuses_object_id() {
         missing(),
     ]);
     assert!(
-        matches!(engine().run(&source, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await, Err(e) if e.kind == ErrorKind::SessionExpired)
+        matches!(engine(store.clone()).upload(&source, &drive, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await, Err(e) if e.kind == ErrorKind::SessionExpired)
     );
     assert!(
         store
@@ -540,18 +538,17 @@ async fn expiration_requires_explicit_restart_and_reuses_object_id() {
         object(&drive, &identity),
     )]);
     let epochs = Mutex::new(Vec::new());
-    engine()
-        .run(
+    engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy {
                     allow_restart: true,
                 },
-                stop: &StopToken::default(),
-                progress: &|p| epochs.lock().unwrap().push(p.epoch),
+                stop: StopToken::default(),
+                progress: Some(&|p| epochs.lock().unwrap().push(p.epoch)),
             },
         )
         .await
@@ -580,20 +577,19 @@ async fn server_offset_can_move_backwards_without_trusting_checkpoint() {
         .header("Range", "bytes=0-262143"),
     ]);
     let stop = StopToken::default();
-    let _ = engine()
-        .run(
+    let _ = engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &stop,
-                progress: &|p| {
+                stop: stop.clone(),
+                progress: Some(&|p| {
                     if p.persisted > 0 {
                         stop.stop()
                     }
-                },
+                }),
             },
         )
         .await;
@@ -621,16 +617,15 @@ async fn server_offset_can_move_backwards_without_trusting_checkpoint() {
         )
         .range("bytes 262144-307199/307200"),
     ]);
-    engine()
-        .run(
+    engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
@@ -660,16 +655,15 @@ async fn empty_file_and_authorization_refresh_are_supported() {
         Reply::new("POST", "/drive/v3/files", 200, object(&drive, &identity)),
     ]);
     assert_eq!(
-        engine()
-            .run(
+        engine(store.clone())
+            .upload(
                 &source,
                 &drive,
-                &store,
-                RunOptions {
+                UploadOptions {
                     intent: intent(),
                     policy: UploadPolicy::default(),
-                    stop: &StopToken::default(),
-                    progress: &|_| {}
+                    stop: StopToken::default(),
+                    progress: Some(&|_| {})
                 }
             )
             .await
@@ -708,7 +702,7 @@ async fn invalid_range_returns_protocol_error_and_keeps_checkpoint() {
         .header("Range", "bytes=0-999"),
     ]);
     assert!(
-        matches!(engine().run(&source, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::ResultUnknown)
+        matches!(engine(store.clone()).upload(&source, &drive, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::ResultUnknown)
     );
     assert!(
         store
@@ -723,6 +717,7 @@ async fn invalid_range_returns_protocol_error_and_keeps_checkpoint() {
     server.finished();
 }
 
+#[derive(Clone)]
 struct FailingStore {
     inner: FileCheckpointStore,
     fail_receipt: Arc<AtomicUsize>,
@@ -787,12 +782,12 @@ async fn remote_completion_survives_receipt_save_failure_and_instance_mismatch()
         object(&drive, &identity),
     )]);
     assert!(
-        matches!(engine().run(&source, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::Checkpoint)
+        matches!(engine(store.clone()).upload(&source, &drive, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::Checkpoint)
     );
     let mut another = drive.clone();
     another.identity.instance = "another-account".into();
     assert!(
-        matches!(engine().run(&source, &another, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::IdentityMismatch)
+        matches!(engine(store.clone()).upload(&source, &another, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::IdentityMismatch)
     );
     server.add(vec![Reply::new(
         "GET",
@@ -800,16 +795,15 @@ async fn remote_completion_survives_receipt_save_failure_and_instance_mismatch()
         200,
         object(&drive, &identity),
     )]);
-    let receipt = engine()
-        .run(
+    let receipt = engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
@@ -817,7 +811,7 @@ async fn remote_completion_survives_receipt_save_failure_and_instance_mismatch()
     let mut wrong = receipt.clone();
     wrong.object = "not-the-object".into();
     assert!(
-        matches!(engine().confirm(&store,&wrong).await,Err(e) if e.kind==ErrorKind::IdentityMismatch)
+        matches!(engine(store.clone()).confirm(&wrong).await,Err(e) if e.kind==ErrorKind::IdentityMismatch)
     );
     let lease = store.acquire("operation-1").await.unwrap();
     let mut saved = lease.load().await.unwrap().unwrap();
@@ -825,7 +819,7 @@ async fn remote_completion_survives_receipt_save_failure_and_instance_mismatch()
     lease.save(&saved).await.unwrap();
     drop(lease);
     assert!(
-        matches!(engine().run(&source, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::IncompatibleVersion)
+        matches!(engine(store.clone()).upload(&source, &drive, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::IncompatibleVersion)
     );
     server.finished();
 }
@@ -848,20 +842,19 @@ async fn changed_source_and_driver_version_preserve_recovery_record() {
         .header("Range", "bytes=0-262143"),
     ]);
     let stop = StopToken::default();
-    let _ = engine()
-        .run(
+    let _ = engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &stop,
-                progress: &|p| {
+                stop: stop.clone(),
+                progress: Some(&|p| {
                     if p.persisted > 0 {
                         stop.stop()
                     }
-                },
+                }),
             },
         )
         .await;
@@ -874,7 +867,7 @@ async fn changed_source_and_driver_version_preserve_recovery_record() {
     lease.save(&saved).await.unwrap();
     drop(lease);
     assert!(
-        matches!(engine().run(&source, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::IncompatibleVersion)
+        matches!(engine(store.clone()).upload(&source, &drive, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::IncompatibleVersion)
     );
     tokio::fs::write(dir.path().join("source.bin"), b"changed")
         .await
@@ -883,7 +876,7 @@ async fn changed_source_and_driver_version_preserve_recovery_record() {
         .await
         .unwrap();
     assert!(
-        matches!(engine().run(&replaced, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy::default(), stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::SourceChanged)
+        matches!(engine(store.clone()).upload(&replaced, &drive, UploadOptions { intent: intent(), policy: UploadPolicy::default(), stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::SourceChanged)
     );
     assert!(
         store
@@ -976,7 +969,7 @@ async fn expired_session_restart_count_is_bounded() {
         }
     }
     assert!(
-        matches!(engine().run(&source, &drive, &store, RunOptions { intent: intent(), policy: UploadPolicy{allow_restart:true}, stop: &StopToken::default(), progress: &|_|{} }).await,Err(e) if e.kind==ErrorKind::SessionExpired)
+        matches!(engine(store.clone()).upload(&source, &drive, UploadOptions { intent: intent(), policy: UploadPolicy{allow_restart:true}, stop: StopToken::default(), progress: Some(&|_|{})}).await,Err(e) if e.kind==ErrorKind::SessionExpired)
     );
     assert_eq!(
         store
@@ -1050,7 +1043,7 @@ async fn a_new_process_resumes_the_persisted_checkpoint() {
     ]);
     let stop = StopToken::default();
     assert!(
-        matches!(engine().run(&source,&drive,&store,RunOptions{intent:intent(),policy:UploadPolicy::default(),stop:&stop,progress:&|p|if p.persisted>0{stop.stop()}}).await,Err(e) if e.kind==ErrorKind::Paused)
+        matches!(engine(store.clone()).upload(&source,&drive,UploadOptions{intent:intent(),policy:UploadPolicy::default(),stop:stop.clone(),progress: Some(&|p|if p.persisted>0{stop.stop()})}).await,Err(e) if e.kind==ErrorKind::Paused)
     );
     server.add(vec![
         missing(),
@@ -1120,16 +1113,15 @@ async fn resume_child() {
     let source = FileSource::open(root.join("source.bin")).await.unwrap();
     let store = FileCheckpointStore::new(root.join("cp"));
     assert_eq!(
-        engine()
-            .run(
+        engine(store.clone())
+            .upload(
                 &source,
                 &drive,
-                &store,
-                RunOptions {
+                UploadOptions {
                     intent: intent(),
                     policy: UploadPolicy::default(),
-                    stop: &StopToken::default(),
-                    progress: &|_| {}
+                    stop: StopToken::default(),
+                    progress: Some(&|_| {})
                 }
             )
             .await
@@ -1271,6 +1263,9 @@ async fn a_stop_during_source_read_prevents_scheduling_another_request() {
         stop: &'a StopToken,
     }
     impl Source for StopsRead<'_> {
+        fn max_read_size(&self) -> usize {
+            self.source.max_read_size()
+        }
         fn identity(&self) -> BoxFuture<'_, waybill::source::SourceIdentity> {
             self.source.identity()
         }
@@ -1293,16 +1288,15 @@ async fn a_stop_during_source_read_prevents_scheduling_another_request() {
     let store = FileCheckpointStore::new(dir.path().join("checkpoints"));
     server.add(prepare());
     server.add(initialize(&server));
-    let result = engine()
-        .run(
+    let result = engine(store.clone())
+        .upload(
             &source,
             &drive,
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: intent(),
                 policy: UploadPolicy::default(),
-                stop: &stop,
-                progress: &|_| {},
+                stop: stop.clone(),
+                progress: Some(&|_| {}),
             },
         )
         .await;
@@ -1585,7 +1579,7 @@ async fn download_identity_uses_version_md5_and_size() {
             .digest
             .as_ref()
             .map(|d| (d.algorithm, d.value.as_str())),
-        Some((waybill::download::DigestAlgorithm::Md5, MD5_16))
+        Some((waybill::content::DigestAlgorithm::Md5, MD5_16))
     );
     server.finished();
 }
@@ -1732,5 +1726,87 @@ async fn list_folder_maps_children_with_folder_flags() {
         Some("2026-10-01T00:00:00Z")
     );
     assert!(children[2].size.is_none(), "原生文档无字节长度");
+    server.finished();
+}
+
+#[tokio::test]
+async fn upload_alignment_is_checked_before_preparing_a_remote_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    let source = source(&dir, 300 * 1024).await;
+    let store = FileCheckpointStore::new(dir.path().join("cp"));
+    let result = TransferEngine::new(store.clone())
+        .with_budget(Arc::new(ResourceBudget::new(128 * 1024, 1).unwrap()))
+        .upload(&source, &drive, UploadOptions::new("limits", "file.bin"))
+        .await;
+    assert!(matches!(result, Err(e) if e.kind == ErrorKind::InvalidInput));
+    assert!(!dir.path().join("cp").exists());
+    server.finished();
+}
+
+#[tokio::test]
+async fn drive_path_constraints_are_checked_before_network_io() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    let result = drive
+        .plan_target(&UploadOptions::new("path", "../file.bin").intent)
+        .await;
+    assert!(matches!(result, Err(e) if e.kind == ErrorKind::InvalidInput));
+    server.finished();
+}
+
+#[tokio::test]
+async fn a_large_budget_is_clamped_to_the_backend_chunk_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    let source = source(&dir, 9 * 1024 * 1024).await;
+    let identity = source.identity().await.unwrap();
+    server.add(prepare());
+    server.add(initialize(&server));
+    server.add(vec![
+        Reply::new(
+            "PUT",
+            "/upload/drive/v3/files",
+            308,
+            serde_json::Value::Null,
+        )
+        .header("Range", "bytes=0-8388607")
+        .range("bytes 0-8388607/9437184"),
+        Reply::new(
+            "PUT",
+            "/upload/drive/v3/files",
+            200,
+            object(&drive, &identity),
+        )
+        .range("bytes 8388608-9437183/9437184"),
+    ]);
+    let engine = TransferEngine::new(FileCheckpointStore::new(dir.path().join("cp")))
+        .with_budget(Arc::new(ResourceBudget::new(32 * 1024 * 1024, 1).unwrap()));
+    let receipt = engine
+        .upload(
+            &source,
+            &drive,
+            UploadOptions::new("operation-1", "payload.bin"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.size, 9 * 1024 * 1024);
+    server.finished();
+}
+
+#[tokio::test]
+async fn invalid_server_digest_is_rejected_instead_of_downgrading_verification() {
+    let server = Server::new().await;
+    let drive = drive(&server, Arc::new(Tokens::new()));
+    server.add(vec![file_metadata(
+        "file-1",
+        "a.zip",
+        "16",
+        Some("invalid-md5"),
+    )]);
+    let result = drive.media("file-1").unwrap().identity().await;
+    assert!(matches!(result, Err(e) if e.kind == ErrorKind::Protocol));
     server.finished();
 }

@@ -9,13 +9,21 @@ use serde_json::json;
 use waybill::{
     BoxFuture,
     checkpoint::DriverState,
-    download::{DigestAlgorithm, Verification},
+    content::Verification,
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
     source::SourceIdentity,
-    upload::{Receipt, SessionStatus, UploadIntent, UploadSink},
+    transfer::Receipt,
+    upload::{SessionStatus, UploadIntent, UploadSink},
 };
 impl UploadSink for Gdrive {
+    fn chunk_limits(&self) -> waybill::upload::UploadChunkLimits {
+        waybill::upload::UploadChunkLimits {
+            max_size: 8 * 1024 * 1024,
+            alignment: 256 * 1024,
+        }
+    }
+
     fn identity(&self) -> ServiceIdentity {
         self.identity.clone()
     }
@@ -192,10 +200,8 @@ impl Gdrive {
                 target: intent.target.clone(),
                 object: file.id,
                 size: source.size,
-                verified: Verification::Digest {
-                    algorithm: DigestAlgorithm::Blake3,
-                    value: source.blake3.clone(),
-                },
+                // appProperties 是客户端声明，不能证明 Google 校验过 BLAKE3。
+                verified: Verification::Length,
             },
         })
     }

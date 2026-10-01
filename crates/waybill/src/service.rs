@@ -58,6 +58,21 @@ pub struct ServiceIdentity {
     /// 稳定且不含凭证的宿主命名空间。
     pub instance: String,
 }
+impl ServiceIdentity {
+    /// 校验稳定、非敏感的实例命名空间；构造服务和开始传输时调用。
+    pub fn validate(&self) -> Result<()> {
+        if self.instance.is_empty()
+            || self.instance.len() > 256
+            || self.instance.chars().any(char::is_control)
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid service instance",
+            ));
+        }
+        Ok(())
+    }
+}
 /// 当前实例的首期能力，不外推浏览器或其他后端。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capabilities {

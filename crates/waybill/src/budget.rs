@@ -23,7 +23,7 @@ impl Default for ResourceBudget {
 impl ResourceBudget {
     /// 核心只约束共享内存上界：块 1 B..=32 MiB、并发 1..=16。
     /// 块的对齐与后端专属上限（如 Drive 要求 256 KiB 的倍数且不超过 8 MiB）
-    /// 由对应 service 在写入边界自行校验，不进核心预算。
+    /// 由 service 的端口声明，引擎选择有效交集，service 在 IO 边界再次校验。
     pub fn new(chunk_size: usize, concurrency: usize) -> Result<Self> {
         if chunk_size == 0 || chunk_size > 32 * 1024 * 1024 || !(1..=16).contains(&concurrency) {
             return Err(Error::new(
@@ -37,7 +37,7 @@ impl ResourceBudget {
             active: AtomicUsize::new(0),
         })
     }
-    /// 共享上传数据缓冲的最大字节数，不包括有界校验 / 元数据开销。
+    /// 共享上传 / 下载数据缓冲的最大字节数，不包括有界校验 / 元数据开销。
     pub fn max_data_bytes(&self) -> usize {
         self.chunk_size * self.concurrency
     }
@@ -54,7 +54,7 @@ impl ResourceBudget {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.concurrency).then_some(n + 1)
             })
-            .map_err(|_| Error::new(ErrorKind::ResourceBusy, "upload budget exhausted"))?;
+            .map_err(|_| Error::new(ErrorKind::ResourceBusy, "transfer budget exhausted"))?;
         Ok(Permit(self.clone()))
     }
 }

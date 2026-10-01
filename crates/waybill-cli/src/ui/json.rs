@@ -107,7 +107,7 @@ mod tests {
     use super::*;
     use waybill::{
         service::{ServiceId, ServiceIdentity},
-        upload::Receipt,
+        transfer::Receipt,
     };
 
     #[test]

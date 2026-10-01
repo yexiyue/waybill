@@ -1,5 +1,5 @@
 //! 下载引擎的契约级测试：区间账本、并行调度、先落盘后记账、
-//! 发布失败只重发布与 v1 信封兼容。源与目标为行为可注入的替身。
+//! 发布失败只重发布与信封方向隔离。源与目标为行为可注入的替身。
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -13,13 +13,15 @@ use waybill::{
     budget::ResourceBudget,
     checkpoint::{Checkpoint, CheckpointLease, CheckpointStore, Flow},
     checkpoint::{DownloadFlow, DriverState},
+    content::{Digest, DigestAlgorithm, Verification},
     download::{
-        Digest, DigestAlgorithm, DownloadEngine, DownloadIntent, DownloadOptions, DownloadProgress,
-        DownloadSource, DownloadStatus, DownloadTarget, Interval, RemoteIdentity, Verification,
+        DownloadIntent, DownloadOptions, DownloadProgress, DownloadSource, DownloadStatus,
+        DownloadTarget, Interval, RemoteIdentity,
     },
     error::{Error, ErrorKind},
     service::{Capabilities, ServiceId, ServiceIdentity},
-    upload::{ConflictPolicy, Receipt, StopToken},
+    transfer::TransferEngine,
+    transfer::{ConflictPolicy, Receipt, StopToken},
 };
 
 /// 全局事件序列：write / verify / publish / save 按发生顺序记录，
@@ -37,6 +39,7 @@ fn log(events: &Events, entry: String) {
 /// 可注入延迟、失败与版本变化的云端源替身。
 struct FakeSource {
     instance: String,
+    read_limit: usize,
     data: Vec<u8>,
     revision: Mutex<String>,
     digest: Option<Digest>,
@@ -50,6 +53,7 @@ impl FakeSource {
     fn new(size: usize) -> Self {
         Self {
             instance: "source-account".into(),
+            read_limit: 32 * 1024 * 1024,
             data: (0..size).map(|byte| (byte % 251) as u8).collect(),
             revision: Mutex::new("rev-1".into()),
             digest: Some(Digest {
@@ -77,6 +81,10 @@ impl FakeSource {
     }
 }
 impl DownloadSource for FakeSource {
+    fn max_read_size(&self) -> usize {
+        self.read_limit
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             range_download: true,
@@ -136,6 +144,7 @@ struct FakeTarget {
     events: Events,
     inner: Mutex<TargetInner>,
     support_random_write: bool,
+    write_limit: usize,
 }
 struct TargetInner {
     verified: bool,
@@ -164,6 +173,7 @@ impl FakeTarget {
                 fail_verify: false,
             }),
             support_random_write: true,
+            write_limit: 32 * 1024 * 1024,
         }
     }
     fn build_receipt(&self, intent: &DownloadIntent, source: &RemoteIdentity) -> Receipt {
@@ -185,6 +195,10 @@ impl FakeTarget {
     }
 }
 impl DownloadTarget for FakeTarget {
+    fn max_write_size(&self) -> usize {
+        self.write_limit
+    }
+
     fn identity(&self) -> ServiceIdentity {
         self.identity.clone()
     }
@@ -428,8 +442,13 @@ fn intent(operation: &str) -> DownloadIntent {
         conflict: ConflictPolicy::Reject,
     }
 }
-fn engine(chunk: usize, concurrency: usize) -> DownloadEngine {
-    DownloadEngine::new(Arc::new(ResourceBudget::new(chunk, concurrency).unwrap()))
+fn engine(
+    chunk: usize,
+    concurrency: usize,
+    store: impl CheckpointStore + 'static,
+) -> TransferEngine {
+    TransferEngine::new(store)
+        .with_budget(Arc::new(ResourceBudget::new(chunk, concurrency).unwrap()))
 }
 fn options<'a>(
     intent: DownloadIntent,
@@ -438,8 +457,8 @@ fn options<'a>(
 ) -> DownloadOptions<'a> {
     DownloadOptions {
         intent,
-        stop,
-        progress,
+        stop: stop.clone(),
+        progress: Some(progress),
     }
 }
 
@@ -451,11 +470,10 @@ async fn out_of_order_arrivals_merge_into_one_interval() {
     source.delays.insert(0, Duration::from_millis(30));
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    let receipt = engine(8, 2)
-        .run(
+    let receipt = engine(8, 2, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -483,11 +501,10 @@ async fn budget_bounds_inflight_reads() {
     let source = FakeSource::new(24);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    engine(8, 1)
-        .run(
+    engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -517,11 +534,10 @@ async fn resumed_ledger_skips_persisted_ranges() {
         }
         .checkpoint(),
     );
-    let receipt = engine(8, 2)
-        .run(
+    let receipt = engine(8, 2, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -538,11 +554,10 @@ async fn writes_are_synced_before_the_ledger_records_them() {
     let source = FakeSource::new(16);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    engine(8, 1)
-        .run(
+    engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -576,11 +591,10 @@ async fn single_stream_failure_leaves_a_hole_for_the_rerun() {
     source.failures.lock().unwrap().insert(8);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -589,11 +603,10 @@ async fn single_stream_failure_leaves_a_hole_for_the_rerun() {
     // 清除故障重跑：只补缺失区间。
     source.failures.lock().unwrap().clear();
     let reads_before = source.reads.lock().unwrap().len();
-    let receipt = engine(8, 1)
-        .run(
+    let receipt = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -615,11 +628,10 @@ async fn stop_pauses_between_chunks_and_rerun_resumes() {
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
     let stop = StopToken::default();
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &stop, &|progress| {
                 if progress.persisted == 8 {
                     stop.stop();
@@ -629,11 +641,10 @@ async fn stop_pauses_between_chunks_and_rerun_resumes() {
         .await;
     assert!(matches!(result, Err(e) if e.kind == ErrorKind::Paused));
     assert_eq!(source.reads.lock().unwrap().len(), 1);
-    let receipt = engine(8, 1)
-        .run(
+    let receipt = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -649,11 +660,10 @@ async fn stop_with_a_complete_ledger_defers_publish() {
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
     let stop = StopToken::default();
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &stop, &|_| {
                 stop.stop();
             }),
@@ -669,11 +679,10 @@ async fn stop_with_a_complete_ledger_defers_publish() {
         "停止后不得发布"
     );
     let reads_before = source.reads.lock().unwrap().len();
-    let receipt = engine(8, 1)
-        .run(
+    let receipt = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -693,11 +702,10 @@ async fn early_destination_conflict_rejects_before_any_read() {
     let target = FakeTarget::new(&events);
     target.inner.lock().unwrap().dest_occupied = true;
     let store = SharedStore::new(&events);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -716,11 +724,10 @@ async fn publish_failure_keeps_staging_and_rerun_only_publishes() {
     let target = FakeTarget::new(&events);
     target.inner.lock().unwrap().fail_publish_once = true;
     let store = SharedStore::new(&events);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -735,11 +742,10 @@ async fn publish_failure_keeps_staging_and_rerun_only_publishes() {
         .filter(|entry| entry.as_str() == "verify")
         .count();
     // 重跑：不再读取、不重复校验，直接发布。
-    let receipt = engine(8, 1)
-        .run(
+    let receipt = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -763,11 +769,10 @@ async fn publish_window_reconciles_the_destination() {
     let store = SharedStore::new(&events);
     let progress = Mutex::new(Vec::new());
     store.fail_save_with_receipt.store(true, Ordering::Release);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|update| {
                 progress.lock().unwrap().push(update);
             }),
@@ -786,11 +791,10 @@ async fn publish_window_reconciles_the_destination() {
         "回执持久化失败不得报告完成"
     );
     // 完成对账分支同样必须先持久化回执，再发送完成进度。
-    let failed_reconciliation = engine(8, 1)
-        .run(
+    let failed_reconciliation = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|update| {
                 progress.lock().unwrap().push(update);
             }),
@@ -807,11 +811,10 @@ async fn publish_window_reconciles_the_destination() {
     // 重跑对账目标位置：零读取返回原回执。
     store.fail_save_with_receipt.store(false, Ordering::Release);
     let reads_before = source.reads.lock().unwrap().len();
-    let receipt = engine(8, 1)
-        .run(
+    let receipt = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|update| {
                 progress.lock().unwrap().push(update);
             }),
@@ -829,7 +832,7 @@ async fn publish_window_reconciles_the_destination() {
         1
     );
     assert_eq!(source.reads.lock().unwrap().len(), reads_before);
-    engine(8, 1).confirm(&store, &receipt).await.unwrap();
+    engine(8, 1, store.clone()).confirm(&receipt).await.unwrap();
     assert!(!store.contains("op-1"));
 }
 
@@ -839,22 +842,20 @@ async fn revision_change_is_rejected_and_the_record_survives() {
     let source = FakeSource::new(16);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    engine(8, 1)
-        .run(
+    engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
         .unwrap();
     // 消费者尚未 confirm，远端更新了对象：同操作重跑必须拒绝。
     *source.revision.lock().unwrap() = "rev-2".into();
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -869,11 +870,10 @@ async fn digest_mismatch_keeps_staging_for_the_rerun() {
     let target = FakeTarget::new(&events);
     target.inner.lock().unwrap().fail_verify = true;
     let store = SharedStore::new(&events);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -888,11 +888,10 @@ async fn digest_mismatch_keeps_staging_for_the_rerun() {
     );
     let fetched = source.reads.lock().unwrap().len();
     target.inner.lock().unwrap().fail_verify = false;
-    let receipt = engine(8, 1)
-        .run(
+    let receipt = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -911,11 +910,10 @@ async fn empty_file_never_reads_and_publishes() {
     let source = FakeSource::new(0);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    let receipt = engine(8, 2)
-        .run(
+    let receipt = engine(8, 2, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -934,11 +932,10 @@ async fn capability_shortfalls_are_rejected_before_any_io() {
         ..FakeTarget::new(&events)
     };
     let store = SharedStore::new(&events);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &weak_target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -978,11 +975,10 @@ async fn upload_records_cannot_drive_a_download_operation() {
     }
     .checkpoint();
     store.seed(upload);
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("op-1"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -1061,11 +1057,10 @@ async fn matching_object_from_a_different_source_instance_cannot_resume() {
     let source = FakeSource::new(16);
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
-    engine(8, 1)
-        .run(
+    engine(8, 1, store.clone())
+        .download(
             &source,
             &target,
-            &store,
             options(intent("namespace-bound"), &StopToken::default(), &|_| {}),
         )
         .await
@@ -1076,11 +1071,10 @@ async fn matching_object_from_a_different_source_instance_cannot_resume() {
     let mut original_identity = source.identity_value();
     original_identity.service.instance = other.instance.clone();
     assert_eq!(original_identity, other.identity_value());
-    let result = engine(8, 1)
-        .run(
+    let result = engine(8, 1, store.clone())
+        .download(
             &other,
             &target,
-            &store,
             options(intent("namespace-bound"), &StopToken::default(), &|_| {}),
         )
         .await;
@@ -1148,11 +1142,10 @@ async fn malformed_saved_ledgers_are_rejected_before_reads_or_writes() {
             .checkpoint(),
         );
         let saved = store.records.lock().unwrap().get(label).unwrap().clone();
-        let result = engine(8, 2)
-            .run(
+        let result = engine(8, 2, store.clone())
+            .download(
                 &source,
                 &target,
-                &store,
                 options(intent(label), &StopToken::default(), &|_| {}),
             )
             .await;
@@ -1168,4 +1161,104 @@ async fn malformed_saved_ledgers_are_rejected_before_reads_or_writes() {
             "{label}"
         );
     }
+}
+
+#[tokio::test]
+async fn engine_negotiates_port_limits_and_default_options_need_no_callbacks() {
+    let events = events();
+    let mut source = FakeSource::new(11);
+    source.read_limit = 3;
+    let mut target = FakeTarget::new(&events);
+    target.write_limit = 5;
+    let store = SharedStore::new(&events);
+    let engine = TransferEngine::new(Arc::new(store.clone()))
+        .with_budget(Arc::new(ResourceBudget::new(8, 1).unwrap()));
+    let receipt = engine
+        .download(
+            &source,
+            &target,
+            DownloadOptions::new("limits", "/tmp/file.bin"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*source.reads.lock().unwrap(), [0, 3, 6, 9]);
+    assert!(store.contains("limits"));
+    engine.confirm(&receipt).await.unwrap();
+    engine.confirm(&receipt).await.unwrap();
+    assert!(!store.contains("limits"));
+}
+
+#[tokio::test]
+async fn zero_port_limit_is_rejected_without_allocating_a_checkpoint() {
+    let events = events();
+    let mut source = FakeSource::new(11);
+    source.read_limit = 0;
+    let target = FakeTarget::new(&events);
+    let store = SharedStore::new(&events);
+    let error = TransferEngine::new(store.clone())
+        .download(
+            &source,
+            &target,
+            DownloadOptions::new("invalid-limits", "/tmp/file.bin"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::InvalidInput);
+    assert!(!store.contains("invalid-limits"));
+    assert!(source.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn completed_download_rechecks_remote_version_after_local_reconciliation() {
+    struct ChangingRemote<'a> {
+        inner: &'a FakeSource,
+        calls: AtomicUsize,
+    }
+    impl DownloadSource for ChangingRemote<'_> {
+        fn max_read_size(&self) -> usize {
+            self.inner.max_read_size()
+        }
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+        fn identity(&self) -> BoxFuture<'_, RemoteIdentity> {
+            Box::pin(async move {
+                let mut identity = self.inner.identity().await?;
+                if self.calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                    identity.revision = "updated-during-reconciliation".into();
+                }
+                Ok(identity)
+            })
+        }
+        fn read_range(&self, offset: u64, length: usize) -> BoxFuture<'_, Vec<u8>> {
+            self.inner.read_range(offset, length)
+        }
+    }
+    let events = events();
+    let source = FakeSource::new(8);
+    let target = FakeTarget::new(&events);
+    let store = SharedStore::new(&events);
+    let engine = engine(8, 1, store.clone());
+    engine
+        .download(
+            &source,
+            &target,
+            DownloadOptions::new("version-window", "/tmp/file"),
+        )
+        .await
+        .unwrap();
+    let updated = ChangingRemote {
+        inner: &source,
+        calls: AtomicUsize::new(0),
+    };
+    let error = engine
+        .download(
+            &updated,
+            &target,
+            DownloadOptions::new("version-window", "/tmp/file"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::SourceChanged);
+    assert!(store.contains("version-window"));
 }

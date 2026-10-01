@@ -27,6 +27,8 @@ soft-canonicalize.workspace = true
 url.workspace = true
 clap.workspace = true
 directories.workspace = true
-ratatui-kit.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]

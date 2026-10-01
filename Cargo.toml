@@ -30,8 +30,8 @@ url = "=2.5.4"
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 clap = { version = "4.5", features = ["derive"] }
 directories = "6"
-# 按需开启所用特性；tree / virtual-list / router 暂无使用场景。
-ratatui-kit = { version = "0.10", features = ["table", "atom"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # 原生 service 的依赖锁由仓库保存；核心不依赖 IO 或执行器。
 [profile.release]

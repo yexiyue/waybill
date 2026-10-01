@@ -19,15 +19,12 @@ use tokio::{
 };
 use waybill::{
     BoxFuture,
-    budget::ResourceBudget,
     checkpoint::DriverState,
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
     source::{Source, SourceIdentity},
-    upload::{
-        ConflictPolicy, RunOptions, SessionStatus, StopToken, UploadEngine, UploadIntent,
-        UploadPolicy, UploadSink,
-    },
+    transfer::{ConflictPolicy, StopToken, TransferEngine},
+    upload::{SessionStatus, UploadIntent, UploadOptions, UploadPolicy, UploadSink},
 };
 use waybill_service_fs::{FileCheckpointStore, FileSource};
 use waybill_service_gdrive::{
@@ -356,7 +353,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         host,
     )?;
     let store = FileCheckpointStore::new(root.join("checkpoints"));
-    let engine = UploadEngine::new(Arc::new(ResourceBudget::default()));
+    let engine = TransferEngine::new(store);
     let stop = StopToken::default();
     let pause = action == "pause";
     let crash = action == "crash";
@@ -371,19 +368,18 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let digest = source.identity().await?.blake3;
     let receipt = engine
-        .run(
+        .upload(
             &source,
             sink.as_ref(),
-            &store,
-            RunOptions {
+            UploadOptions {
                 intent: UploadIntent {
                     operation: config.operation.clone(),
                     target: target.into(),
                     conflict: ConflictPolicy::Reject,
                 },
                 policy: UploadPolicy::default(),
-                stop: &stop,
-                progress: &|p| {
+                stop: stop.clone(),
+                progress: Some(&|p| {
                     println!(
                         "persisted={}/{} complete={} epoch={}",
                         p.persisted, p.total, p.complete, p.epoch
@@ -395,7 +391,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     if pause && p.persisted >= 8 * 1024 * 1024 && !p.complete {
                         stop.stop();
                     }
-                },
+                }),
             },
         )
         .await;
@@ -420,7 +416,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 }),
             )?;
             if args[3] == "confirm" {
-                engine.confirm(&store, &receipt).await?;
+                engine.confirm(&receipt).await?;
             }
             println!("真实 Drive 上传/对账及测试文件下载哈希核验完成，结果保存在私有状态目录。");
             Ok(())
@@ -481,6 +477,10 @@ struct LostCompletion {
     dropped: std::sync::atomic::AtomicBool,
 }
 impl UploadSink for LostCompletion {
+    fn chunk_limits(&self) -> waybill::upload::UploadChunkLimits {
+        self.inner.chunk_limits()
+    }
+
     fn identity(&self) -> ServiceIdentity {
         self.inner.identity()
     }

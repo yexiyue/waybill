@@ -4,34 +4,18 @@
 //! `.part` 并在同步后才确认区间。乱序容忍是目标契约的属性，引擎的
 //! 并发调度只是它的一个使用者。完成进度以区间账本为唯一事实源，
 //! `.part` 长度与输出事件的百分比都不构成完成证据。
+use crate::content::{Digest, valid_digest_value};
+use crate::transfer::TransferEngine;
 use crate::{
     BoxFuture,
-    budget::ResourceBudget,
-    checkpoint::{Checkpoint, CheckpointStore, DownloadFlow, DriverState, Flow},
+    checkpoint::{Checkpoint, DownloadFlow, DriverState, Flow},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
-    upload::{ConflictPolicy, Receipt, StopToken, valid_operation},
+    transfer::{ConflictPolicy, Receipt, StopToken, valid_operation},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-/// 服务端声明的预期内容摘要；算法与值成对出现，不跨算法比较。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DigestAlgorithm {
-    /// Drive 等后端返回的 MD5 小写十六进制。
-    Md5,
-    /// 本库上传契约使用的 BLAKE3 小写十六进制。
-    Blake3,
-}
-/// 服务端提供的预期摘要；缺失时下载只声明长度一致性。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Digest {
-    /// 摘要算法。
-    pub algorithm: DigestAlgorithm,
-    /// 小写十六进制值；长度由算法决定。
-    pub value: String,
-}
 /// 云端源的当前身份；revision 由 service 内部约定，核心只比较相等。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteIdentity {
@@ -49,7 +33,10 @@ pub struct RemoteIdentity {
 impl RemoteIdentity {
     /// 校验引用、版本与摘要形态。
     pub fn validate(&self) -> Result<()> {
-        let bounded = |value: &str| !value.is_empty() && value.len() <= 256;
+        self.service.validate()?;
+        let bounded = |value: &str| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        };
         if !bounded(&self.service.instance)
             || self.service.instance.chars().any(char::is_control)
             || !bounded(&self.reference)
@@ -66,23 +53,10 @@ impl RemoteIdentity {
         }
     }
 }
-fn valid_digest_value(digest: &Digest) -> Result<()> {
-    let expected = match digest.algorithm {
-        DigestAlgorithm::Md5 => 32,
-        DigestAlgorithm::Blake3 => 64,
-    };
-    if digest.value.len() != expected
-        || !digest
-            .value
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(Error::new(ErrorKind::InvalidInput, "invalid digest value"));
-    }
-    Ok(())
-}
 /// 逐块范围读取的云端源；宿主不冻结云对象，靠 identity 复核版本。
 pub trait DownloadSource: Send + Sync {
+    /// 单次范围读取的最大字节数；必须非零。
+    fn max_read_size(&self) -> usize;
     /// 实际能力；不支持范围读取的源在开始前被拒绝。
     fn capabilities(&self) -> Capabilities;
     /// 廉价复核并返回当前身份；每次调用都应反映服务端最新元数据。
@@ -110,20 +84,20 @@ pub enum DownloadStatus {
         receipt: Receipt,
     },
 }
-/// 消费者指定的下载意图；target 是宿主解析后的本地目标文件路径。
+/// 消费者指定的下载意图；target 由目标 service 解释。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadIntent {
     /// 持久稳定的操作 ID；同一操作不得更换源或目标。
     pub operation: String,
-    /// 本地目标文件路径；目录展开由宿主完成。
+    /// 非空、有界且不含控制字符的目标引用；本地 service 要求稳定绝对路径。
     pub target: String,
     /// 同名目标策略。
     pub conflict: ConflictPolicy,
 }
 impl DownloadIntent {
-    /// 校验操作标识与本地目标路径。
+    /// 校验操作标识与目标引用；具体路径约束归目标 service。
     pub fn validate(&self) -> Result<()> {
-        if !valid_operation(&self.operation) || !valid_local_target(&self.target) {
+        if !valid_operation(&self.operation) || !crate::object::valid_reference(&self.target) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "invalid download intent",
@@ -131,25 +105,6 @@ impl DownloadIntent {
         }
         Ok(())
     }
-}
-/// 本地目标路径：非空、无控制字符、总长 ≤4096 字节；段非空且不为
-/// `.`、`..`，允许以 `/` 起始的绝对路径；反斜杠在 Linux / macOS 是
-/// 合法文件名字节，不按远端路径规则禁止。
-fn valid_local_target(target: &str) -> bool {
-    if target.is_empty()
-        || target.len() > 4096
-        || target.ends_with('/')
-        || target.chars().any(|c| c.is_control())
-    {
-        return false;
-    }
-    let mut segments = target.split('/');
-    if target.starts_with('/') {
-        segments.next();
-    }
-    segments.all(|segment| {
-        !segment.is_empty() && segment != "." && segment != ".." && segment.len() <= 255
-    })
 }
 /// 半开字节区间 `[start, end)`；账本中合并有序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,22 +189,6 @@ fn next_missing(
         None
     }
 }
-/// 完成回执记录的内容验证证据；由目标侧按实际校验结果声明。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Verification {
-    /// 无内容证据；v1 上传回执的兼容默认值。
-    #[default]
-    Unverified,
-    /// 仅长度一致。
-    Length,
-    /// 与服务端预期摘要一致。
-    Digest {
-        /// 摘要算法。
-        algorithm: DigestAlgorithm,
-        /// 小写十六进制值。
-        value: String,
-    },
-}
 /// 不将读取、持久化和发布混为一谈的下载进度。
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
@@ -267,15 +206,17 @@ pub struct DownloadOptions<'a> {
     /// 稳定下载意图。
     pub intent: DownloadIntent,
     /// 宿主暂停信号。
-    pub stop: &'a StopToken,
+    pub stop: StopToken,
     /// 有界同步通知；回调不能阻塞或保存数据缓冲。
-    pub progress: &'a (dyn Fn(DownloadProgress) + Send + Sync),
+    pub progress: Option<&'a (dyn Fn(DownloadProgress) + Send + Sync)>,
 }
 /// 本地下载目标：`.part` 随机写、同步、校验与最终发布。
 ///
 /// `write_chunk` 按精确偏移寻址且不要求调用顺序——乱序容忍是契约属性。
 /// 数据写入并同步之后方法才能返回成功；驱动状态由引擎串行更新。
 pub trait DownloadTarget: Send + Sync {
+    /// 单次精确偏移写入的最大字节数；必须非零。
+    fn max_write_size(&self) -> usize;
     /// 稳定实例身份。
     fn identity(&self) -> ServiceIdentity;
     /// 实际能力。
@@ -324,24 +265,36 @@ pub trait DownloadTarget: Send + Sync {
         state: &'a DriverState,
     ) -> BoxFuture<'a, DownloadStatus>;
 }
-/// 只依赖公开端口的下载引擎。
-pub struct DownloadEngine {
-    budget: Arc<ResourceBudget>,
-}
-impl DownloadEngine {
-    /// 注入共享预算；在途读取数与缓冲受 `chunk × concurrency` 约束。
-    pub fn new(budget: Arc<ResourceBudget>) -> Self {
-        Self { budget }
+impl<'a> DownloadOptions<'a> {
+    /// 使用稳定操作 ID 与目标路径创建默认选项；开始传输时统一校验。
+    /// 默认拒绝同名目标，不暂停且不订阅进度。
+    pub fn new(operation: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            intent: DownloadIntent {
+                operation: operation.into(),
+                target: target.into(),
+                conflict: ConflictPolicy::Reject,
+            },
+            stop: StopToken::default(),
+            progress: None,
+        }
     }
+}
+impl TransferEngine {
     /// 开始或恢复下载。数据写入并同步后才记账；回执持久化后才返回成功。
-    pub async fn run(
+    pub async fn download(
         &self,
         source: &dyn DownloadSource,
         target: &dyn DownloadTarget,
-        store: &dyn CheckpointStore,
         options: DownloadOptions<'_>,
     ) -> Result<Receipt> {
+        let progress = options.progress.unwrap_or(&|_| {});
+        if options.stop.is_stopped() {
+            return Err(Error::new(ErrorKind::Paused, "download paused"));
+        }
         options.intent.validate()?;
+        let service = target.identity();
+        service.validate()?;
         let caps = target.capabilities();
         if !caps.random_write || !caps.durable_publish {
             return Err(Error::new(
@@ -355,7 +308,18 @@ impl DownloadEngine {
                 "ranged download source required",
             ));
         }
-        let lease = store.acquire(&options.intent.operation).await?;
+        let chunk_size = self
+            .budget
+            .chunk_size()
+            .min(source.max_read_size())
+            .min(target.max_write_size());
+        if chunk_size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid download chunk limits",
+            ));
+        }
+        let lease = self.store.acquire(&options.intent.operation).await?;
         if options.stop.is_stopped() {
             return Err(Error::new(ErrorKind::Paused, "download paused"));
         }
@@ -363,7 +327,7 @@ impl DownloadEngine {
         identity.validate()?;
         let mut flow = match lease.load().await? {
             Some(saved) => {
-                if !Checkpoint::supported(saved.version, &saved.flow) {
+                if !Checkpoint::supported(saved.version) {
                     return Err(Error::new(
                         ErrorKind::IncompatibleVersion,
                         "checkpoint version",
@@ -378,7 +342,7 @@ impl DownloadEngine {
                     }
                     Flow::Download(flow) => {
                         if flow.intent != options.intent
-                            || flow.service != target.identity()
+                            || flow.service != service.clone()
                             || flow.source.service != identity.service
                         {
                             return Err(Error::new(
@@ -392,18 +356,7 @@ impl DownloadEngine {
                                 "source identity changed",
                             ));
                         }
-                        if flow.persisted.len() > INTERVAL_LIMIT
-                            || flow
-                                .persisted
-                                .iter()
-                                .any(|i| i.start >= i.end || i.end > identity.size)
-                            || flow
-                                .persisted
-                                .windows(2)
-                                .any(|pair| pair[0].end >= pair[1].start)
-                        {
-                            return Err(Error::new(ErrorKind::Checkpoint, "invalid saved ledger"));
-                        }
+                        flow.persisted_bytes()?;
                         flow
                     }
                 }
@@ -411,7 +364,7 @@ impl DownloadEngine {
             None => {
                 let flow = DownloadFlow {
                     intent: options.intent.clone(),
-                    service: target.identity(),
+                    service: service.clone(),
                     source: identity.clone(),
                     persisted: Vec::new(),
                     driver: target.prepare(&options.intent, &identity).await?,
@@ -428,11 +381,17 @@ impl DownloadEngine {
             .await?
         {
             DownloadStatus::Complete { state, receipt } => {
+                if source.identity().await? != flow.source {
+                    return Err(Error::new(
+                        ErrorKind::SourceChanged,
+                        "source changed during download reconciliation",
+                    ));
+                }
                 validate_receipt(&receipt, &flow)?;
                 flow.driver = state;
                 flow.receipt = Some(receipt.clone());
                 lease.save(&flow.checkpoint()).await?;
-                report(&flow, 0, true, options.progress);
+                report(&flow, 0, true, progress);
                 return Ok(receipt);
             }
             DownloadStatus::NeedsReset(state) => {
@@ -479,7 +438,7 @@ impl DownloadEngine {
         }
         // 有界并行补洞：各流领取最小缺失区间，write_chunk 由引擎串行调用。
         let concurrency = self.budget.concurrency_limit();
-        let chunk = self.budget.chunk_size() as u64;
+        let chunk = chunk_size as u64;
         let mut in_flight = FuturesUnordered::new();
         let mut claimed: Vec<Interval> = Vec::new();
         let mut read = 0u64;
@@ -533,7 +492,7 @@ impl DownloadEngine {
             claimed.retain(|interval| interval.start != offset);
             verified = false;
             lease.save(&flow.checkpoint()).await?;
-            report(&flow, read, false, options.progress);
+            report(&flow, read, false, progress);
             if fully_covered(&flow.persisted, flow.source.size) {
                 break;
             }
@@ -573,29 +532,8 @@ impl DownloadEngine {
         validate_receipt(&receipt, &flow)?;
         flow.receipt = Some(receipt.clone());
         lease.save(&flow.checkpoint()).await?;
-        report(&flow, read, true, options.progress);
+        report(&flow, read, true, progress);
         Ok(receipt)
-    }
-    /// 消费者已提交业务记账后，以准确回执删除 checkpoint。
-    pub async fn confirm(&self, store: &dyn CheckpointStore, receipt: &Receipt) -> Result<()> {
-        let lease = store.acquire(&receipt.operation).await?;
-        if let Some(checkpoint) = lease.load().await? {
-            if !Checkpoint::supported(checkpoint.version, &checkpoint.flow) {
-                return Err(Error::new(
-                    ErrorKind::IncompatibleVersion,
-                    "checkpoint version",
-                ));
-            }
-            let matched = match &checkpoint.flow {
-                Flow::Upload(flow) => flow.receipt.as_ref() == Some(receipt),
-                Flow::Download(flow) => flow.receipt.as_ref() == Some(receipt),
-            };
-            if !matched {
-                return Err(Error::new(ErrorKind::IdentityMismatch, "receipt mismatch"));
-            }
-            lease.remove().await?;
-        }
-        Ok(())
     }
 }
 /// 回执必须与当前操作、实例、目标与源长度一致。

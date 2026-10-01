@@ -4,12 +4,13 @@ use crate::{
     download::{DownloadIntent, Interval, RemoteIdentity},
     service::ServiceIdentity,
     source::SourceIdentity,
-    upload::{Receipt, UploadIntent},
+    transfer::Receipt,
+    upload::UploadIntent,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
 /// 当前公共信封格式；未知版本拒绝恢复并保留记录。
-/// v2 起按 `flow` 区分上传与下载记录；v1 平铺上传记录按上传流兼容加载。
+/// 按 `flow` 区分上传与下载记录；旧版本不自动转换。
 pub const FORMAT_VERSION: u32 = 2;
 /// service 私有的版本化状态。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +46,7 @@ pub struct UploadFlow {
     pub receipt: Option<Receipt>,
 }
 impl UploadFlow {
-    /// 以当前字段打包为 v2 信封；v1 记录在下次保存时升级。
+    /// 以当前字段打包为版本化信封。
     pub fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             version: FORMAT_VERSION,
@@ -70,7 +71,28 @@ pub struct DownloadFlow {
     pub receipt: Option<Receipt>,
 }
 impl DownloadFlow {
-    /// 以当前字段打包为 v2 信封；保存时始终升级到最新格式。
+    /// 核验区间账本并返回持久字节数；损坏账本不得计算进度或驱动恢复。
+    pub fn persisted_bytes(&self) -> crate::error::Result<u64> {
+        use crate::{
+            download::INTERVAL_LIMIT,
+            error::{Error, ErrorKind},
+        };
+        if self.persisted.len() > INTERVAL_LIMIT
+            || self
+                .persisted
+                .iter()
+                .any(|i| i.start >= i.end || i.end > self.source.size)
+            || self
+                .persisted
+                .windows(2)
+                .any(|pair| pair[0].end >= pair[1].start)
+        {
+            return Err(Error::new(ErrorKind::Checkpoint, "invalid saved ledger"));
+        }
+        // 区间非空、有序、不重叠且位于源内，区间和不会超过 size。
+        Ok(self.persisted.iter().map(|i| i.end - i.start).sum())
+    }
+    /// 以当前字段打包为版本化信封。
     pub fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             version: FORMAT_VERSION,
@@ -95,13 +117,10 @@ pub struct Checkpoint {
     /// 方向及记录字段。
     pub flow: Flow,
 }
-/// v1 平铺上传记录没有 `flow` 对象；由存储层在解码前包一层上传流
-/// （见 waybill-service-fs 的 `decode_checkpoint`），核心只接受带方向
-/// 标签的 v2 结构。v1 记录在下次保存时升级为 v2。
 impl Checkpoint {
-    /// 引擎可接受的信封版本：v2，或兼容加载的 v1 上传记录。
-    pub fn supported(version: u32, flow: &Flow) -> bool {
-        version == FORMAT_VERSION || (version == 1 && matches!(flow, Flow::Upload(_)))
+    /// 引擎只接受当前信封版本。
+    pub fn supported(version: u32) -> bool {
+        version == FORMAT_VERSION
     }
     /// 上传记录引用；下载记录返回 None。
     pub fn upload(&self) -> Option<&UploadFlow> {
@@ -131,4 +150,10 @@ pub trait CheckpointLease: Send + Sync {
 pub trait CheckpointStore: Send + Sync {
     /// operation 为存储的排他键；不同实例复用相同 ID 时须由信封拒绝。
     fn acquire<'a>(&'a self, operation: &'a str) -> BoxFuture<'a, Box<dyn CheckpointLease>>;
+}
+
+impl<T: CheckpointStore + ?Sized> CheckpointStore for std::sync::Arc<T> {
+    fn acquire<'a>(&'a self, operation: &'a str) -> BoxFuture<'a, Box<dyn CheckpointLease>> {
+        (**self).acquire(operation)
+    }
 }

@@ -1,5 +1,5 @@
 //! 与输出方式无关的生命周期事件。
-use waybill::upload::Receipt;
+use waybill::transfer::Receipt;
 /// 发往输出 sink 的事件流；字段只含可展示数据。
 pub(crate) enum Event {
     /// 单个文件开始传输。

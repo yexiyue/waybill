@@ -7,9 +7,10 @@ use tokio::sync::mpsc;
 use waybill::{
     error::ErrorKind,
     source::Source,
-    upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent},
+    transfer::{ConflictPolicy, StopToken, TransferEngine},
+    upload::{UploadIntent, UploadOptions},
 };
-use waybill_service_fs::{FileCheckpointStore, FileSource};
+use waybill_service_fs::FileSource;
 /// 一个待投递文件：本地路径与解析后的远端目标。
 pub(crate) struct UploadJob {
     pub path: PathBuf,
@@ -20,8 +21,7 @@ pub(crate) struct UploadJob {
 /// 编排资源由一个队列拥有，输出通过有界通道交付。
 pub(crate) struct UploadRunner {
     pub sink: std::sync::Arc<dyn waybill::upload::UploadSink>,
-    pub store: FileCheckpointStore,
-    pub engine: UploadEngine,
+    pub engine: TransferEngine,
     pub stop: StopToken,
     pub conflict: ConflictPolicy,
     pub events: mpsc::Sender<Event>,
@@ -88,19 +88,18 @@ impl UploadRunner {
             .map_err(|_| output_closed())?;
         let receipt = self
             .engine
-            .run(
+            .upload(
                 &source,
                 self.sink.as_ref(),
-                &self.store,
-                RunOptions {
+                UploadOptions {
                     intent: UploadIntent {
                         operation,
                         target: job.target.clone(),
                         conflict: self.conflict,
                     },
                     policy: Default::default(),
-                    stop: &self.stop,
-                    progress: &|p| {
+                    stop: self.stop.clone(),
+                    progress: Some(&|p| {
                         emit_progress(
                             &self.events,
                             &self.stop,
@@ -113,7 +112,7 @@ impl UploadRunner {
                                 complete: p.complete,
                             },
                         );
-                    },
+                    }),
                 },
             )
             .await
@@ -177,15 +176,12 @@ mod tests {
     };
     use waybill::{
         BoxFuture,
-        budget::ResourceBudget,
         checkpoint::DriverState,
         error::{Error, ErrorKind},
         service::{Capabilities, ServiceId, ServiceIdentity},
         source::SourceIdentity,
-        upload::{
-            ConflictPolicy, Receipt, SessionStatus, StopToken, UploadEngine, UploadIntent,
-            UploadSink,
-        },
+        transfer::{ConflictPolicy, Receipt, StopToken, TransferEngine},
+        upload::{SessionStatus, UploadIntent, UploadSink},
     };
     use waybill_service_fs::FileCheckpointStore;
 
@@ -195,6 +191,13 @@ mod tests {
     }
 
     impl UploadSink for CompletedSink {
+        fn chunk_limits(&self) -> waybill::upload::UploadChunkLimits {
+            waybill::upload::UploadChunkLimits {
+                max_size: 32 * 1024 * 1024,
+                alignment: 1,
+            }
+        }
+
         fn identity(&self) -> ServiceIdentity {
             ServiceIdentity {
                 service: ServiceId::parse("test:drive").unwrap(),
@@ -273,8 +276,7 @@ mod tests {
         let (events, mut receiver) = tokio::sync::mpsc::channel(64);
         let runner = UploadRunner {
             sink,
-            store: FileCheckpointStore::new(dir.join("checkpoints")),
-            engine: UploadEngine::new(Arc::new(ResourceBudget::default())),
+            engine: TransferEngine::new(FileCheckpointStore::new(dir.join("checkpoints"))),
             stop,
             conflict: ConflictPolicy::Reject,
             events,

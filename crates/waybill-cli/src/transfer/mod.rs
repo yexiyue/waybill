@@ -6,7 +6,7 @@ pub(crate) use download::{DownloadJob, DownloadRunner};
 pub(crate) use events::Event;
 use tokio::sync::mpsc;
 pub(crate) use upload::{UploadJob, UploadRunner};
-use waybill::{error::ErrorKind, upload::StopToken};
+use waybill::{error::ErrorKind, transfer::StopToken};
 /// 队列的最终结果；成功计数经 Done 事件交付，此处只保留退出判定所需。
 pub(crate) struct Outcome {
     pub failures: usize,

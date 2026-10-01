@@ -15,14 +15,12 @@ use tokio::io::AsyncReadExt;
 use waybill::{
     BoxFuture,
     checkpoint::DriverState,
-    download::{
-        DigestAlgorithm, DownloadIntent, DownloadStatus, DownloadTarget, RemoteIdentity,
-        Verification,
-    },
+    content::{DigestAlgorithm, Verification},
+    download::{DownloadIntent, DownloadStatus, DownloadTarget, RemoteIdentity},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
-    upload::ConflictPolicy,
-    upload::Receipt,
+    transfer::ConflictPolicy,
+    transfer::Receipt,
 };
 
 const HASH_BUFFER: usize = 256 * 1024;
@@ -120,8 +118,15 @@ impl LocalTarget {
             payload,
         })
     }
-    fn effective(&self, intent: &DownloadIntent, state: &TargetState) -> PathBuf {
-        state.effective.as_deref().unwrap_or(&intent.target).into()
+    fn effective(&self, intent: &DownloadIntent, state: &TargetState) -> Result<PathBuf> {
+        let target = state.effective.as_deref().unwrap_or(&intent.target);
+        if !valid_local_target(&intent.target) || !valid_local_target(target) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "local target requires an absolute file path",
+            ));
+        }
+        Ok(target.into())
     }
     /// 已校验状态的证据级别；未校验不声明任何内容一致性。
     fn verification_of(source: &RemoteIdentity, verified: bool) -> Verification {
@@ -175,7 +180,31 @@ impl LocalTarget {
         }
     }
 }
+/// 本地目标路径：非空、无控制字符、总长 ≤4096 字节；段非空且不为
+/// `.`、`..`，必须是以 `/` 起始的绝对路径；反斜杠在 Linux / macOS 是
+/// 合法文件名字节，不按远端路径规则禁止。
+fn valid_local_target(target: &str) -> bool {
+    if !target.starts_with('/')
+        || target.is_empty()
+        || target.len() > 4096
+        || target.ends_with('/')
+        || target.chars().any(|c| c.is_control())
+    {
+        return false;
+    }
+    let mut segments = target.split('/');
+    if target.starts_with('/') {
+        segments.next();
+    }
+    segments.all(|segment| {
+        !segment.is_empty() && segment != "." && segment != ".." && segment.len() <= 255
+    })
+}
 impl DownloadTarget for LocalTarget {
+    fn max_write_size(&self) -> usize {
+        32 * 1024 * 1024
+    }
+
     fn identity(&self) -> ServiceIdentity {
         self.identity.clone()
     }
@@ -193,6 +222,12 @@ impl DownloadTarget for LocalTarget {
     ) -> BoxFuture<'a, DriverState> {
         Box::pin(async move {
             intent.validate()?;
+            if !valid_local_target(&intent.target) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "local target requires an absolute file path",
+                ));
+            }
             let effective = match intent.conflict {
                 ConflictPolicy::OperationSuffix
                     if tokio::fs::try_exists(&intent.target).await.map_err(io)? =>
@@ -218,7 +253,7 @@ impl DownloadTarget for LocalTarget {
     ) -> BoxFuture<'a, DownloadStatus> {
         Box::pin(async move {
             let mut decoded = LocalTarget::decode(state)?;
-            let dest = self.effective(intent, &decoded);
+            let dest = self.effective(intent, &decoded)?;
             if !decoded.initialized {
                 // 驱动未初始化：不信任已有暂存，创建新的独占文件。
                 decoded.verified = false;
@@ -287,7 +322,7 @@ impl DownloadTarget for LocalTarget {
     ) -> BoxFuture<'a, DownloadStatus> {
         Box::pin(async move {
             let mut decoded = LocalTarget::decode(state)?;
-            let dest = self.effective(intent, &decoded);
+            let dest = self.effective(intent, &decoded)?;
             if intent.conflict == ConflictPolicy::Reject
                 && decoded.effective.is_none()
                 && tokio::fs::try_exists(&dest).await.map_err(io)?
@@ -409,7 +444,7 @@ impl DownloadTarget for LocalTarget {
                     "staging must be verified before publication",
                 ));
             }
-            let dest = self.effective(intent, &decoded);
+            let dest = self.effective(intent, &decoded)?;
             staging_metadata(&decoded)
                 .await?
                 .ok_or_else(|| Error::new(ErrorKind::Checkpoint, "staging unavailable"))?;

@@ -8,6 +8,10 @@ use waybill::{
 };
 struct MemorySource(Arc<[u8]>);
 impl Source for MemorySource {
+    fn max_read_size(&self) -> usize {
+        32 * 1024 * 1024
+    }
+
     fn identity(&self) -> BoxFuture<'_, SourceIdentity> {
         Box::pin(async {
             Ok(SourceIdentity {

@@ -2,7 +2,19 @@
 pub(crate) mod json;
 pub(crate) mod picker;
 pub(crate) mod plain;
+pub(crate) mod status;
+mod terminal;
 pub(crate) mod tui;
+mod widgets;
+pub(crate) use terminal::Session;
+
+/// 全屏输出需要输入、输出和错误流都连接终端。
+pub(crate) fn interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
 
 /// 人类可读的字节数；二进制单位，与库的块尺寸约定一致。
 pub(crate) fn human_bytes(value: u64) -> String {

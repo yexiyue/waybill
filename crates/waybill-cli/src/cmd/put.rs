@@ -8,15 +8,20 @@ use crate::{
     transfer::{UploadJob, UploadRunner},
     uri,
 };
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 use waybill::{
-    budget::ResourceBudget,
     service::Service,
-    upload::{StopToken, UploadEngine, UploadIntent},
+    transfer::{StopToken, TransferEngine},
+    upload::UploadIntent,
 };
 use waybill_service_fs::FileCheckpointStore;
 
-pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError> {
+pub async fn run(
+    ui: &mut crate::ui::Session,
+    args: PutArgs,
+    json: bool,
+    verbose: u8,
+) -> Result<(), CliError> {
     let PutArgs {
         sources,
         dest,
@@ -71,7 +76,7 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
     let drive = gdrive_host::build(&layout, &dest.account, root).await?;
     let sink = drive.upload_sink()?;
     let store = FileCheckpointStore::new(layout.checkpoints());
-    let engine = UploadEngine::new(Arc::new(ResourceBudget::default()));
+    let engine = TransferEngine::new(store);
     let stop = StopToken::default();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let queued_files = jobs
@@ -81,7 +86,6 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
     let handle = tokio::spawn(
         UploadRunner {
             sink,
-            store,
             engine,
             stop: stop.clone(),
             conflict: conflict.into(),
@@ -90,6 +94,7 @@ pub async fn run(args: PutArgs, json: bool, verbose: u8) -> Result<(), CliError>
         .run(jobs, operation),
     );
     session::run(
+        ui,
         handle,
         rx,
         stop,
@@ -133,6 +138,7 @@ mod tests {
     #[tokio::test]
     async fn batch_target_error_precedes_source_and_credentials() {
         let result = run(
+            &mut crate::ui::Session::default(),
             args(
                 vec!["missing-a".into(), "missing-b".into()],
                 "gdrive://bill/file",
@@ -148,6 +154,7 @@ mod tests {
     async fn invalid_sources_and_intents_fail_before_account_loading() {
         let dir = tempfile::tempdir().unwrap();
         let result = run(
+            &mut crate::ui::Session::default(),
             args(vec![dir.path().into()], "gdrive://bill/file"),
             false,
             0,
@@ -156,12 +163,24 @@ mod tests {
         assert!(matches!(result, Err(CliError::Message(message)) if message.contains("普通文件")));
         let path = dir.path().join("source");
         std::fs::write(&path, b"content").unwrap();
-        let result = run(args(vec![path], "gdrive://bill/../file"), false, 0).await;
+        let result = run(
+            &mut crate::ui::Session::default(),
+            args(vec![path], "gdrive://bill/../file"),
+            false,
+            0,
+        )
+        .await;
         assert!(
             matches!(result, Err(CliError::Waybill(error)) if error.kind == ErrorKind::InvalidInput)
         );
         let path = dir.path().join(OsString::from_vec(vec![b'a', 0xff]));
-        let result = run(args(vec![path], "gdrive://bill/"), false, 0).await;
+        let result = run(
+            &mut crate::ui::Session::default(),
+            args(vec![path], "gdrive://bill/"),
+            false,
+            0,
+        )
+        .await;
         assert!(matches!(result, Err(CliError::Message(message)) if message.contains("UTF-8")));
     }
 }

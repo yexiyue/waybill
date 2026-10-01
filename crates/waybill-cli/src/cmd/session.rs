@@ -4,11 +4,10 @@ use crate::{
     transfer::{Event, Outcome},
     ui,
 };
-use std::io::IsTerminal;
 use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 use waybill::{
     error::{Error, ErrorKind},
-    upload::StopToken,
+    transfer::StopToken,
 };
 
 pub(super) struct Settings {
@@ -20,16 +19,14 @@ pub(super) struct Settings {
 }
 
 pub(super) async fn run(
+    ui: &mut ui::Session,
     handle: JoinHandle<Outcome>,
     receiver: Receiver<Event>,
     stop: StopToken,
     settings: Settings,
 ) -> Result<(), CliError> {
     let abort = handle.abort_handle();
-    let interactive = !settings.json
-        && !settings.no_tui
-        && std::io::stdout().is_terminal()
-        && std::io::stdin().is_terminal();
+    let interactive = !settings.json && !settings.no_tui && ui::interactive_terminal();
     let signal = if interactive {
         None
     } else {
@@ -38,12 +35,15 @@ pub(super) async fn run(
     let rendered = if settings.json {
         ui::json::run(receiver).await
     } else if interactive {
-        ui::tui::run(ui::tui::Handoff {
-            receiver,
-            stop: stop.clone(),
-            banner: settings.banner,
-            queued_files: settings.queued_files,
-        })
+        ui::tui::run(
+            ui,
+            ui::tui::Handoff {
+                receiver,
+                stop: stop.clone(),
+                banner: settings.banner,
+                queued_files: settings.queued_files,
+            },
+        )
         .await
         .map(|forced| {
             if forced {
@@ -130,6 +130,7 @@ mod tests {
         let handle = tokio::spawn(std::future::pending::<Outcome>());
         handle.abort();
         let result = run(
+            &mut ui::Session::default(),
             handle,
             receiver,
             StopToken::default(),

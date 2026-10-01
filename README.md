@@ -96,6 +96,11 @@ upload destinations must still satisfy Google Drive's app access permissions.
 In a picker, Enter opens a folder, Space selects files, `c` confirms, ← / Backspace
 goes up, and `q` / Esc / Ctrl-C cancels. Selections persist across folders.
 
+`wb status` opens a fullscreen local-record browser in a terminal. Use Enter / `d`
+for details, `r` to refresh, `e` for unreadable records (↑↓ to browse), and `q` to exit.
+`wb status --no-tui` prints a list; `wb --json status` retains the JSON array.
+Pickers and transfer dashboards share one fullscreen session across every step.
+
 Transfers show a fullscreen dashboard by default; `--no-tui` uses plain output.
 The first Ctrl-C stops gracefully, and the second aborts immediately. Keep the
 source files, drive configuration, and local records to resume with the same command.
@@ -146,6 +151,13 @@ to keep another copy when a name conflicts.
 | [`waybill-service-fs`](crates/waybill-service-fs/) | Stable local sources, file checkpoints, download staging, and publication |
 | [`waybill-service-gdrive`](crates/waybill-service-gdrive/) | Google Drive protocol, upload reconciliation, ranged reads, and directory access |
 | [`waybill-cli`](crates/waybill-cli/) | `wb`: authorization, drive configuration, interaction, and transfer orchestration |
+
+```rust
+let engine = waybill::TransferEngine::new(checkpoint_store);
+let receipt = engine.upload(source.as_ref(), sink.as_ref(),
+    waybill::UploadOptions::new("stable-operation-id", "backup/file.zip")).await?;
+// Commit the receipt to your application's ledger before engine.confirm(&receipt).
+```
 
 The core is independent of backends and executors. Hosts own authorization and
 credential refresh; services obtain valid credentials at request boundaries.

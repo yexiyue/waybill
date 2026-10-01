@@ -8,15 +8,12 @@ use crate::{
     transfer::{DownloadJob, DownloadRunner},
     uri,
 };
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::{Path, PathBuf};
 use waybill::{
-    budget::ResourceBudget,
-    download::{DownloadEngine, DownloadIntent},
+    download::DownloadIntent,
     error::{Error, ErrorKind},
     service::Service,
+    transfer::TransferEngine,
 };
 use waybill_service_fs::{FileCheckpointStore, FsService};
 use waybill_service_gdrive::{Gdrive, RemoteFile, Resolved};
@@ -24,7 +21,12 @@ use waybill_service_gdrive::{Gdrive, RemoteFile, Resolved};
 /// CLI 本地目标的稳定实例命名空间；重跑必须命中同一实例。
 const LOCAL_INSTANCE: &str = "wb-local-v1";
 
-pub async fn run(args: GetArgs, json: bool, verbose: u8) -> Result<(), CliError> {
+pub async fn run(
+    ui: &mut crate::ui::Session,
+    args: GetArgs,
+    json: bool,
+    verbose: u8,
+) -> Result<(), CliError> {
     let GetArgs {
         source,
         dest,
@@ -70,6 +72,7 @@ pub async fn run(args: GetArgs, json: bool, verbose: u8) -> Result<(), CliError>
         }
     };
     run_files(
+        ui,
         &drive,
         vec![file],
         dest,
@@ -86,6 +89,7 @@ pub async fn run(args: GetArgs, json: bool, verbose: u8) -> Result<(), CliError>
 }
 
 pub(super) async fn run_files(
+    ui: &mut crate::ui::Session,
     drive: &Gdrive,
     files: Vec<RemoteFile>,
     dest: PathBuf,
@@ -133,7 +137,7 @@ pub(super) async fn run_files(
         });
     }
     let local = FsService::new(LOCAL_INSTANCE)?;
-    let stop = waybill::upload::StopToken::default();
+    let stop = waybill::transfer::StopToken::default();
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let queued_files = jobs
         .iter()
@@ -142,8 +146,9 @@ pub(super) async fn run_files(
     let handle = tokio::spawn(
         DownloadRunner {
             target: local.download_target()?,
-            store: FileCheckpointStore::new(Layout::discover()?.checkpoints()),
-            engine: DownloadEngine::new(Arc::new(ResourceBudget::default())),
+            engine: TransferEngine::new(FileCheckpointStore::new(
+                Layout::discover()?.checkpoints(),
+            )),
             stop: stop.clone(),
             conflict: options.conflict.into(),
             events: tx,
@@ -151,6 +156,7 @@ pub(super) async fn run_files(
         .run(jobs, options.operation),
     );
     session::run(
+        ui,
         handle,
         rx,
         stop,
@@ -217,7 +223,13 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_source_uri_fails_before_account_loading() {
-        let result = run(args("gdrive://bill", "./a.iso"), false, 0).await;
+        let result = run(
+            &mut crate::ui::Session::default(),
+            args("gdrive://bill", "./a.iso"),
+            false,
+            0,
+        )
+        .await;
         assert!(
             matches!(result, Err(CliError::Waybill(error)) if error.kind == ErrorKind::InvalidInput)
         );
@@ -225,9 +237,21 @@ mod tests {
 
     #[tokio::test]
     async fn directory_source_and_dest_forms_are_rejected_early() {
-        let result = run(args("gdrive://bill/backup/", "./a.iso"), false, 0).await;
+        let result = run(
+            &mut crate::ui::Session::default(),
+            args("gdrive://bill/backup/", "./a.iso"),
+            false,
+            0,
+        )
+        .await;
         assert!(matches!(result, Err(CliError::Message(m)) if m.contains("目录")));
-        let result = run(args("gdrive://bill/backup/a.iso", "dir/"), false, 0).await;
+        let result = run(
+            &mut crate::ui::Session::default(),
+            args("gdrive://bill/backup/a.iso", "dir/"),
+            false,
+            0,
+        )
+        .await;
         assert!(matches!(result, Err(CliError::Message(m)) if m.contains("/")));
     }
 
@@ -247,8 +271,10 @@ mod tests {
     async fn invalid_operation_fails_before_account_loading() {
         let mut input = args("gdrive://missing-account/a.bin", "./a.bin");
         input.operation = Some("../invalid".into());
-        assert!(matches!(run(input, false, 0).await,
-            Err(CliError::Waybill(e)) if e.kind == ErrorKind::InvalidInput));
+        assert!(
+            matches!(run(&mut crate::ui::Session::default(), input, false, 0).await,
+            Err(CliError::Waybill(e)) if e.kind == ErrorKind::InvalidInput)
+        );
     }
 
     #[test]

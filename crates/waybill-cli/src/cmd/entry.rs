@@ -13,7 +13,11 @@ use crate::{
     uri::{self, DriveUri},
 };
 
-pub(super) async fn drive(command: DriveCommand, json: bool) -> Result<(), CliError> {
+pub(super) async fn drive(
+    ui: &mut crate::ui::Session,
+    command: DriveCommand,
+    json: bool,
+) -> Result<(), CliError> {
     let layout = Layout::discover()?;
     let mut config = Drives::load(&layout)?;
     match command {
@@ -43,7 +47,7 @@ pub(super) async fn drive(command: DriveCommand, json: bool) -> Result<(), CliEr
                 None => {
                     picker::require_interactive(json, false)?;
                     let service = gdrive_host::build(&layout, &drive.account, "root").await?;
-                    browse::cloud(&service, "", CloudMode::Directory)
+                    browse::cloud(ui, &service, "", CloudMode::Directory)
                         .await?
                         .folder
                 }
@@ -63,6 +67,7 @@ pub(super) async fn drive(command: DriveCommand, json: bool) -> Result<(), CliEr
         }
         DriveCommand::List => {}
     }
+    ui.close();
     if json {
         println!("{}", serde_json::to_string(&config)?);
     } else {
@@ -82,6 +87,7 @@ pub(super) async fn drive(command: DriveCommand, json: bool) -> Result<(), CliEr
     Ok(())
 }
 async fn location(
+    ui: &mut crate::ui::Session,
     raw: Option<&str>,
     name: Option<&str>,
     root: Option<&str>,
@@ -156,6 +162,7 @@ async fn location(
                 })
                 .collect();
             let picked = picker::choose(
+                ui,
                 "选择盘 / 已登录账户".into(),
                 rows,
                 "↑↓ 选择 · Enter 确认 · q 取消",
@@ -179,7 +186,12 @@ async fn location(
     ))?;
     Ok((parsed, selected.root))
 }
-pub(super) async fn list(input: ListInput, name: Option<&str>, json: bool) -> Result<(), CliError> {
+pub(super) async fn list(
+    ui: &mut crate::ui::Session,
+    input: ListInput,
+    name: Option<&str>,
+    json: bool,
+) -> Result<(), CliError> {
     let interactive = input.path.is_none();
     if interactive {
         picker::require_interactive(json, input.no_tui)?;
@@ -192,7 +204,7 @@ pub(super) async fn list(input: ListInput, name: Option<&str>, json: bool) -> Re
         }
     });
     let (location, root) =
-        location(raw.as_deref(), name, input.root.as_deref(), interactive).await?;
+        location(ui, raw.as_deref(), name, input.root.as_deref(), interactive).await?;
     if !interactive {
         return list::run(
             ListArgs {
@@ -204,10 +216,11 @@ pub(super) async fn list(input: ListInput, name: Option<&str>, json: bool) -> Re
         .await;
     }
     let drive = gdrive_host::build(&Layout::discover()?, &location.account, &root).await?;
-    browse::cloud(&drive, &location.target, CloudMode::View).await?;
+    browse::cloud(ui, &drive, &location.target, CloudMode::View).await?;
     Ok(())
 }
 pub(super) async fn put(
+    ui: &mut crate::ui::Session,
     mut input: PutInput,
     name: Option<&str>,
     json: bool,
@@ -232,6 +245,7 @@ pub(super) async fn put(
         picker::require_interactive(json, input.transfer.no_tui)?;
     }
     let (mut location, mut root) = location(
+        ui,
         input.dest.as_deref(),
         name,
         input.transfer.root.as_deref(),
@@ -239,17 +253,18 @@ pub(super) async fn put(
     )
     .await?;
     if input.sources.is_empty() {
-        input.sources = browse::local(false).await?;
+        input.sources = browse::local(ui, false).await?;
     }
     if input.dest.is_none() {
         let drive = gdrive_host::build(&Layout::discover()?, &location.account, &root).await?;
-        let selected = browse::cloud(&drive, "", CloudMode::Directory).await?;
+        let selected = browse::cloud(ui, &drive, "", CloudMode::Directory).await?;
         // 人工选择的目标目录作为显式 service 根，支持上传到已有可访问目录。
         root = selected.folder;
         location.target.clear();
         location.directory = true;
     }
     put::run(
+        ui,
         PutArgs {
             sources: input.sources,
             dest: location.to_uri(),
@@ -264,6 +279,7 @@ pub(super) async fn put(
     .await
 }
 pub(super) async fn get(
+    ui: &mut crate::ui::Session,
     mut input: GetInput,
     name: Option<&str>,
     json: bool,
@@ -279,6 +295,7 @@ pub(super) async fn get(
         picker::require_interactive(json, input.transfer.no_tui)?;
     }
     let (location, root) = location(
+        ui,
         input.source.as_deref(),
         name,
         input.transfer.root.as_deref(),
@@ -287,10 +304,11 @@ pub(super) async fn get(
     .await?;
     let dest = match input.dest {
         Some(dest) => get::normalize_destination(&dest)?,
-        None => browse::local(true).await?.remove(0),
+        None => browse::local(ui, true).await?.remove(0),
     };
     if !browsing {
         return get::run(
+            ui,
             crate::cli::GetArgs {
                 source: format!("gdrive://{}/{}", location.account, location.target),
                 dest,
@@ -308,8 +326,8 @@ pub(super) async fn get(
         return Err(CliError::Message("交互多选下载不能指定 --operation".into()));
     }
     let drive = gdrive_host::build(&Layout::discover()?, &location.account, &root).await?;
-    let files = browse::cloud(&drive, &location.target, CloudMode::Files)
+    let files = browse::cloud(ui, &drive, &location.target, CloudMode::Files)
         .await?
         .files;
-    get::run_files(&drive, files, dest, input.transfer, json, verbose).await
+    get::run_files(ui, &drive, files, dest, input.transfer, json, verbose).await
 }

@@ -1,7 +1,7 @@
 # service 开发与宿主接入
 
-当前接口为 0.x 上传与下载原型；架构与兼容策略以 DESIGN.zh-CN.md §11 为准。
-Operator、registry 与配置工厂仍属后续设计。
+当前接口为未发布的 0.x 上传与下载契约；架构以 DESIGN.zh-CN.md §5、§11 为准。
+宿主直接注入公开端口，不依赖 Operator、registry 或配置工厂。
 
 ## 公开边界
 
@@ -9,8 +9,12 @@ Operator、registry 与配置工厂仍属后续设计。
 `Source` 提供完整身份核验与精确范围读；只读 service 的上传默认返回 Unsupported。
 外部实现示例见 `examples/consumer/src/bin/readonly.rs`，不依赖任何私有 helper。
 
-上传消费者使用 `UploadEngine::run(source, sink, store, RunOptions { ... })`。
-核心只依赖公开端口，异步方法返回 `BoxFuture`，没有 Tokio / reqwest / SwarmDrop 依赖。
+消费者一次构造 `TransferEngine::new(store)`，随后调用
+`engine.upload(source, sink, UploadOptions::new(operation, target))` 或
+`engine.download(source, target, DownloadOptions::new(operation, reference))`。
+默认选项无需停止信号或进度回调；有需要时设置 `options.stop` / `options.progress`。
+存储支持具体实现和共享 `Arc<dyn CheckpointStore>`；`engine.clone()` 共享同一存储与预算。
+核心只依赖公开端口，service 异步方法返回 `BoxFuture`，引擎使用执行器无关的 async；没有 Tokio / reqwest / SwarmDrop 依赖。
 Tokio 属于原生 service 与宿主；核心的 Send 约束尚不代表浏览器支持。
 
 `UploadSink` 的责任按生命周期划分：
@@ -26,9 +30,12 @@ Tokio 属于原生 service 与宿主；核心的 Send 约束尚不代表浏览�
 ## 下载源与本地目标
 
 下载方向与上传入口对称：`Service::download_source(reference)` 打开云端源，
-`Service::download_target()` 返回本地目标。核心 `DownloadEngine::run(source,
-target, store, DownloadOptions)` 驱动；上传与下载共用操作 ID、checkpoint 存储、
-错误分类与停止信号，`confirm` 以回执清理记录。
+`Service::download_target()` 返回本地目标。`TransferEngine::download` 驱动；
+上传与下载共用操作 ID、checkpoint 存储、错误分类与停止信号，
+`engine.confirm(&receipt)` 以回执清理记录。
+
+目标引用由目标 service 解释，核心不解析原生路径。service-fs 要求绝对文件路径，
+拒绝 `.`、`..`、空段和控制字符；目录展开与路径规范化由宿主完成。
 
 `DownloadSource` 每次调用 `identity()` 都应反映服务端最新元数据（宿主不冻结
 云对象）；`read_range` 返回恰好 length 字节。`DownloadTarget` 责任划分：
@@ -54,6 +61,7 @@ service-fs 的 `LocalTarget` 实现上述契约；Google 原生文档没有二�
 
 检查点绑定公共格式版本、源、目标、操作 ID 和 service 实例。操作 ID 须跨进程稳定。
 未知公共 / 驱动版本、源变化、目标或实例不匹配均保留记录并返回明确错误。
+当前只接受带 `flow` 的 v2 信封；旧 v1 平铺格式拒绝，不自动兼容转换。
 文件型存储使用进程锁，锁文件不删除，防止不同 inode 导致锁失效；根目录须由宿主独占。
 存储断电持久性取决于本地文件系统的 fsync / rename 保证；不声称网络盘具有相同保证。
 
@@ -61,7 +69,7 @@ service-fs 的 `LocalTarget` 实现上述契约；Google 原生文档没有二�
 每次运行最多重建两次。`StopToken::stop()` 只暂停后续块；在途结果先对账。
 丢弃运行 future 不等于删除远端操作，下一次运行仍需对账。
 
-成功回执先持久化，再返回。消费者先提交业务账本，然后 `UploadEngine::confirm`。
+成功回执先持久化，再返回。消费者先提交业务账本，然后 `engine.confirm(&receipt)`。
 确认仅清理 checkpoint，不删除源或远端对象。确认后不得复用同一操作 ID 启动新任务；
 幂等范围为 checkpoint 保留期间的同一操作，不是跨进程 exactly-once。
 
@@ -80,11 +88,18 @@ prepare 时发现冲突后选择操作后缀，不覆盖。prepare 后新出现�
 会话 URI 只允许 Google HTTPS、固定上传路径、443 端口且不含用户信息或片段。
 本机 HTTP 替身仅在 cfg(test) 中可用，生产 API 没有自定义端点后门。
 哈希 appProperties 是消费者提交的身份数据，不是 Google 校验内容的证明。
+GDrive 上传回执声明 `Verification::Length`；下载校验服务端提供的摘要后才能
+声明 `Verification::Digest`。共有证据类型属于 `content`，回执与停止信号属于 `transfer`。
 
 ## 资源与诊断
 
-多个引擎共享同一 `Arc<ResourceBudget>`：默认 8 MiB 块、最多两条上传，数据缓冲
-上限 16 MiB；繁忙返回 ResourceBusy，由宿主决定等待策略。恢复对账可使确认进度回退，
+一个 `TransferEngine` 的上传与下载自动共享预算；多个引擎通过
+`with_budget(Arc<ResourceBudget>)` 共享。默认 8 MiB 块、两份在途数据缓冲，
+上限 16 MiB；繁忙返回 ResourceBusy，由宿主决定等待策略。
+`Source` / `DownloadSource` 声明 `max_read_size`，`DownloadTarget` 声明
+`max_write_size`，`UploadSink` 声明 `UploadChunkLimits`。引擎选择预算和端口
+允许的块大小，并对上传非末块对齐；小于所需对齐的预算在远端准备前拒绝。
+每个 service 仍在 IO 边界检查范围与块形状。恢复对账可使确认进度回退，
 显式重建递增 epoch；sent、acknowledged、persisted 与 complete 分开表达。
 
 文件校验缓冲及 Tokio 文件内部 IO 复制缓冲各限 256 KiB；元数据响应与 checkpoint 各限 1 MiB；Drive 列表最多 1000 项，

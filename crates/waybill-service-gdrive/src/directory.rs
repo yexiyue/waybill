@@ -7,7 +7,8 @@ use crate::{
 use serde_json::json;
 use waybill::{
     error::{Error, ErrorKind, Result},
-    upload::{ConflictPolicy, UploadIntent},
+    transfer::ConflictPolicy,
+    upload::UploadIntent,
 };
 impl Gdrive {
     /// 解析配置根目录为已验证的文件夹 ID；root 别名经 v2 about 取真实 ID。
@@ -36,6 +37,12 @@ impl Gdrive {
     }
     pub(crate) async fn plan_target(&self, intent: &UploadIntent) -> Result<State> {
         intent.validate()?;
+        if !waybill::object::valid_object_path(&intent.target) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid Drive target path",
+            ));
+        }
         let mut parts: Vec<&str> = intent.target.split('/').collect();
         let name = parts.pop().ok_or_else(protocol)?;
         if parts.len() > 32 {

@@ -70,6 +70,10 @@ impl FileSource {
     }
 }
 impl Source for FileSource {
+    fn max_read_size(&self) -> usize {
+        8 * 1024 * 1024
+    }
+
     fn identity(&self) -> BoxFuture<'_, SourceIdentity> {
         Box::pin(async move {
             let mut file = self.file.lock().await;
@@ -105,7 +109,7 @@ impl Source for FileSource {
         })
     }
 }
-/// 最小只读 service：只实现 Source，不实现上传。
+/// 本地 service：稳定上传源与下载目标，不实现云端上传会话。
 pub struct FsService {
     identity: ServiceIdentity,
 }
@@ -113,15 +117,12 @@ impl FsService {
     /// instance 是消费者的稳定本地命名空间。
     pub fn new(instance: impl Into<String>) -> Result<Self> {
         let instance = instance.into();
-        if instance.is_empty() || instance.len() > 256 {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid fs instance"));
-        }
-        Ok(Self {
-            identity: ServiceIdentity {
-                service: ServiceId::parse("waybill:fs")?,
-                instance,
-            },
-        })
+        let identity = ServiceIdentity {
+            service: ServiceId::parse("waybill:fs")?,
+            instance,
+        };
+        identity.validate()?;
+        Ok(Self { identity })
     }
 }
 impl Service for FsService {

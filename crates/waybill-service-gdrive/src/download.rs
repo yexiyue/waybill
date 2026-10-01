@@ -10,7 +10,8 @@ use crate::{
 use std::sync::Arc;
 use waybill::{
     BoxFuture,
-    download::{Digest, DigestAlgorithm, DownloadSource, RemoteIdentity},
+    content::{Digest, DigestAlgorithm},
+    download::{DownloadSource, RemoteIdentity},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
 };
@@ -63,6 +64,10 @@ pub struct GdriveMedia {
     reference: String,
 }
 impl DownloadSource for GdriveMedia {
+    fn max_read_size(&self) -> usize {
+        8 * 1024 * 1024
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             range_download: true,
@@ -89,14 +94,14 @@ impl DownloadSource for GdriveMedia {
                     "Drive native document cannot be downloaded",
                 ));
             }
-            let md5 = file
-                .md5_checksum
-                .as_deref()
-                .filter(|value| valid_md5(value))
-                .map(|value| Digest {
+            let md5 = match file.md5_checksum.as_deref() {
+                Some(value) if valid_md5(value) => Some(Digest {
                     algorithm: DigestAlgorithm::Md5,
                     value: value.to_string(),
-                });
+                }),
+                Some(_) => return Err(protocol()),
+                None => None,
+            };
             let revision = format!(
                 "{}:{}:{}",
                 file.version.as_deref().unwrap_or_default(),

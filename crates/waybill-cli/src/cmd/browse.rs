@@ -26,6 +26,7 @@ pub struct CloudSelection {
     pub files: Vec<RemoteFile>,
 }
 pub async fn cloud(
+    ui: &mut crate::ui::Session,
     drive: &Gdrive,
     start: &str,
     mode: CloudMode,
@@ -82,6 +83,7 @@ pub async fn cloud(
             format!("云盘 /{path}")
         };
         let picked = picker::choose(
+            ui,
             title,
             rows,
             if mode == CloudMode::Files {
@@ -150,7 +152,10 @@ pub async fn cloud(
         }
     }
 }
-pub async fn local(directory_only: bool) -> Result<Vec<PathBuf>, CliError> {
+pub async fn local(
+    ui: &mut crate::ui::Session,
+    directory_only: bool,
+) -> Result<Vec<PathBuf>, CliError> {
     let mut path = std::env::current_dir()?.canonicalize()?;
     let mut selected = std::collections::BTreeSet::new();
     loop {
@@ -192,6 +197,7 @@ pub async fn local(directory_only: bool) -> Result<Vec<PathBuf>, CliError> {
             )
         };
         let picked = picker::choose(
+            ui,
             title,
             rows,
             if directory_only { DIR_HELP } else { FILE_HELP },

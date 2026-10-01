@@ -43,7 +43,11 @@ pub enum Command {
     /// 列出云盘目录内容。
     List(ListInput),
     /// 列出本机恢复记录与已完成回执。
-    Status,
+    Status {
+        /// 禁用全屏面板，使用行式输出。
+        #[arg(long)]
+        no_tui: bool,
+    },
     /// 配置盘名称、账户和默认根目录。
     Drive {
         #[command(subcommand)]
@@ -176,7 +180,7 @@ pub enum Conflict {
     /// 冲突时追加稳定操作后缀，不覆盖其他对象。
     OperationSuffix,
 }
-impl From<Conflict> for waybill::upload::ConflictPolicy {
+impl From<Conflict> for waybill::transfer::ConflictPolicy {
     fn from(value: Conflict) -> Self {
         match value {
             Conflict::Reject => Self::Reject,

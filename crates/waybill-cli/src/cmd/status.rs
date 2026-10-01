@@ -13,42 +13,47 @@ const RECORD_LIMIT: usize = 1000;
 
 /// 单条在途会话的展示行；字段与 JSON 输出共用。
 #[derive(Serialize)]
-struct SessionRow {
-    operation: String,
+pub(crate) struct SessionRow {
+    pub(crate) operation: String,
     /// upload = 上传；download = 下载。
-    direction: &'static str,
-    target: String,
-    service: String,
-    instance: String,
+    pub(crate) direction: &'static str,
+    pub(crate) target: String,
+    pub(crate) service: String,
+    pub(crate) instance: String,
     /// 上传为服务端确认偏移；下载为已持久化区间和。
-    acknowledged: u64,
-    total: u64,
-    restarts: u32,
+    pub(crate) acknowledged: u64,
+    pub(crate) total: u64,
+    pub(crate) restarts: u32,
     /// in_flight = 传输未完成；completed = 已完成，保留回执用于重复投递对账。
-    state: &'static str,
+    pub(crate) state: &'static str,
 }
 
 /// 无法读取的记录与原因；文件名安全，原因只保留静态分类。
-struct Unreadable {
-    file: String,
-    reason: &'static str,
+pub(crate) struct Unreadable {
+    pub(crate) file: String,
+    pub(crate) reason: &'static str,
 }
 
-pub async fn run(json: bool) -> Result<(), CliError> {
-    let layout = Layout::discover()?;
-    let dir = layout.checkpoints();
-    let (rows, unreadable) = scan(&dir)?;
-    if json {
-        println!("{}", serde_json::to_string(&rows)?);
+pub async fn run(ui: &mut crate::ui::Session, json: bool, no_tui: bool) -> Result<(), CliError> {
+    let dir = Layout::discover()?.checkpoints();
+    let unreadable = if !json && !no_tui && crate::ui::interactive_terminal() {
+        crate::ui::status::run(ui, || scan(&dir)).await?
     } else {
-        render(&dir, &rows);
-    }
+        let (rows, unreadable) = scan(&dir)?;
+        if json {
+            println!("{}", serde_json::to_string(&rows)?);
+        } else {
+            render(&dir, &rows);
+        }
+        unreadable
+    };
+    ui.close();
     for entry in &unreadable {
         eprintln!("wb: 无法读取 {}: {}", entry.file, entry.reason);
     }
     if !unreadable.is_empty() {
         return Err(CliError::Message(format!(
-            "{} 条运单记录无法读取；上方结果不完整",
+            "{} 条运单记录无法读取；结果不完整",
             unreadable.len()
         )));
     }
@@ -85,9 +90,13 @@ fn scan(dir: &Path) -> Result<(Vec<SessionRow>, Vec<Unreadable>), CliError> {
             continue;
         };
         match waybill_service_fs::decode_checkpoint(&bytes) {
-            Ok(checkpoint) if Checkpoint::supported(checkpoint.version, &checkpoint.flow) => {
-                rows.push(row(&checkpoint))
-            }
+            Ok(checkpoint) if Checkpoint::supported(checkpoint.version) => match row(&checkpoint) {
+                Ok(row) => rows.push(row),
+                Err(_) => unreadable.push(Unreadable {
+                    file,
+                    reason: "invalid progress",
+                }),
+            },
             Ok(_) => unreadable.push(Unreadable {
                 file,
                 reason: "incompatible version",
@@ -103,8 +112,14 @@ fn scan(dir: &Path) -> Result<(Vec<SessionRow>, Vec<Unreadable>), CliError> {
 }
 
 /// 只读取公共信封字段；下载行 acknowledged 汇总区间账本。
-fn row(checkpoint: &Checkpoint) -> SessionRow {
-    match &checkpoint.flow {
+fn row(checkpoint: &Checkpoint) -> waybill::error::Result<SessionRow> {
+    Ok(match &checkpoint.flow {
+        Flow::Upload(flow) if flow.acknowledged > flow.source.size => {
+            return Err(waybill::error::Error::new(
+                waybill::error::ErrorKind::Checkpoint,
+                "invalid saved offset",
+            ));
+        }
         Flow::Upload(flow) => SessionRow {
             operation: flow.intent.operation.clone(),
             direction: "upload",
@@ -126,11 +141,7 @@ fn row(checkpoint: &Checkpoint) -> SessionRow {
             target: flow.intent.target.clone(),
             service: flow.service.service.as_str().to_string(),
             instance: flow.service.instance.clone(),
-            acknowledged: flow
-                .persisted
-                .iter()
-                .map(|interval| interval.end - interval.start)
-                .sum(),
+            acknowledged: flow.persisted_bytes()?,
             total: flow.source.size,
             restarts: 0,
             state: if flow.receipt.is_some() {
@@ -139,7 +150,7 @@ fn row(checkpoint: &Checkpoint) -> SessionRow {
                 "in_flight"
             },
         },
-    }
+    })
 }
 
 fn read_checkpoint(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -187,10 +198,12 @@ mod tests {
     use std::path::PathBuf;
     use waybill::{
         checkpoint::{Checkpoint, DownloadFlow, DriverState, UploadFlow},
-        download::{Digest, DigestAlgorithm, DownloadIntent, Interval, RemoteIdentity},
+        content::{Digest, DigestAlgorithm},
+        download::{DownloadIntent, Interval, RemoteIdentity},
         service::{ServiceId, ServiceIdentity},
         source::SourceIdentity,
-        upload::{ConflictPolicy, Receipt, UploadIntent},
+        transfer::{ConflictPolicy, Receipt},
+        upload::UploadIntent,
     };
 
     fn upload_checkpoint(operation: &str, acknowledged: u64, with_receipt: bool) -> Checkpoint {
@@ -301,9 +314,9 @@ mod tests {
         assert_eq!(unreadable[0].reason, "decode failed");
     }
 
-    /// v1 平铺上传记录（M1 保存格式）必须继续可读。
+    /// 旧平铺记录作为不可读条目保留，不伪装成当前格式。
     #[test]
-    fn scan_still_reads_v1_flat_records() {
+    fn scan_reports_legacy_flat_records_without_deleting_them() {
         let dir = tempfile::tempdir().unwrap();
         let v1 = format!(
             "{{\"version\":1,\"intent\":{{\"operation\":\"legacy\",\"target\":\"a.bin\",\
@@ -315,11 +328,9 @@ mod tests {
         );
         std::fs::write(dir.path().join("legacy.json"), v1).unwrap();
         let (rows, unreadable) = scan(dir.path()).unwrap();
-        assert!(unreadable.is_empty());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].operation, "legacy");
-        assert_eq!(rows[0].direction, "upload");
-        assert_eq!(rows[0].acknowledged, 4);
+        assert!(rows.is_empty());
+        assert_eq!(unreadable.len(), 1);
+        assert!(dir.path().join("legacy.json").exists());
     }
 
     #[test]
@@ -353,5 +364,24 @@ mod tests {
         assert!(rows.is_empty());
         assert_eq!(unreadable.len(), 1);
         assert_eq!(unreadable[0].reason, "read failed or record too large");
+    }
+    #[test]
+    fn corrupt_download_progress_is_reported_without_panicking_or_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut checkpoint = download_checkpoint("bad-progress");
+        let Flow::Download(flow) = &mut checkpoint.flow else {
+            panic!("download flow")
+        };
+        flow.persisted = vec![Interval {
+            start: u64::MAX,
+            end: 0,
+        }];
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let (rows, unreadable) = scan(dir.path()).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].reason, "invalid progress");
+        assert!(path.exists());
     }
 }

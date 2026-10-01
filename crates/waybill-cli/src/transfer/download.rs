@@ -5,9 +5,8 @@ use super::{
 use tokio::sync::mpsc;
 use waybill::{
     error::ErrorKind,
-    upload::{ConflictPolicy, StopToken},
+    transfer::{ConflictPolicy, StopToken},
 };
-use waybill_service_fs::FileCheckpointStore;
 /// 单个待取回文件：解析后的云对象与本地目标。
 pub(crate) struct DownloadJob {
     pub source: std::sync::Arc<dyn waybill::download::DownloadSource>,
@@ -20,8 +19,7 @@ pub(crate) struct DownloadJob {
 /// 下载编排资源；事件复用上传队列的形态。
 pub(crate) struct DownloadRunner {
     pub target: std::sync::Arc<dyn waybill::download::DownloadTarget>,
-    pub store: FileCheckpointStore,
-    pub engine: waybill::download::DownloadEngine,
+    pub engine: waybill::transfer::TransferEngine,
     pub stop: StopToken,
     pub conflict: ConflictPolicy,
     pub events: mpsc::Sender<Event>,
@@ -56,6 +54,9 @@ impl DownloadRunner {
                     failures += 1;
                     if kind == ErrorKind::Paused {
                         stopped = true;
+                        break;
+                    }
+                    if kind == ErrorKind::Authentication {
                         break;
                     }
                 }
@@ -93,18 +94,17 @@ impl DownloadRunner {
             .map_err(|_| output_closed())?;
         let receipt = self
             .engine
-            .run(
+            .download(
                 job.source.as_ref(),
                 self.target.as_ref(),
-                &self.store,
                 waybill::download::DownloadOptions {
                     intent: waybill::download::DownloadIntent {
                         operation,
                         target: job.target.clone(),
                         conflict: self.conflict,
                     },
-                    stop: &self.stop,
-                    progress: &|p| {
+                    stop: self.stop.clone(),
+                    progress: Some(&|p| {
                         emit_progress(
                             &self.events,
                             &self.stop,
@@ -117,7 +117,7 @@ impl DownloadRunner {
                                 complete: p.complete,
                             },
                         );
-                    },
+                    }),
                 },
             )
             .await

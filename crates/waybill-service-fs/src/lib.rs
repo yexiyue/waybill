@@ -1,4 +1,4 @@
-//! Linux / macOS 的稳定文件源、上传 checkpoint 存储与下载本地目标。
+//! Linux / macOS 的稳定文件源、传输 checkpoint 存储与下载本地目标。
 //! 上传源文件由宿主冻结；下载暂存与发布由本 crate 的目标实现承担。
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

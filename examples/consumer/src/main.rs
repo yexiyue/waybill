@@ -1,11 +1,9 @@
 //! 独立消费者只通过公开 API 组装；它不是完整 CLI 或 OAuth 工具。
 use std::{sync::Arc, time::Duration};
 use waybill::{
-    BoxFuture,
-    budget::ResourceBudget,
+    BoxFuture, TransferEngine, UploadOptions,
     error::{Error, ErrorKind},
     service::Service,
-    upload::{ConflictPolicy, RunOptions, StopToken, UploadEngine, UploadIntent, UploadPolicy},
 };
 use waybill_service_fs::{FileCheckpointStore, FsService};
 use waybill_service_gdrive::{
@@ -51,28 +49,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let sink = drive.upload_sink()?;
     let store = FileCheckpointStore::new(&args[2]);
-    let engine = UploadEngine::new(Arc::new(ResourceBudget::default()));
+    let engine = TransferEngine::new(store);
+    let progress = |p: waybill::upload::UploadProgress| {
+        println!(
+            "persisted={}/{} complete={} epoch={}",
+            p.persisted, p.total, p.complete, p.epoch
+        );
+    };
+    let mut options = UploadOptions::new(&args[3], &args[7]);
+    options.progress = Some(&progress);
     let receipt = engine
-        .run(
-            source.as_ref(),
-            sink.as_ref(),
-            &store,
-            RunOptions {
-                intent: UploadIntent {
-                    operation: args[3].clone(),
-                    target: args[7].clone(),
-                    conflict: ConflictPolicy::Reject,
-                },
-                policy: UploadPolicy::default(),
-                stop: &StopToken::default(),
-                progress: &|p| {
-                    println!(
-                        "persisted={}/{} complete={} epoch={}",
-                        p.persisted, p.total, p.complete, p.epoch
-                    )
-                },
-            },
-        )
+        .upload(source.as_ref(), sink.as_ref(), options)
         .await?;
     println!(
         "receipt operation={} object={} size={}",
@@ -80,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // 实际应用必须先提交业务账本；示例要求用户显式确认才能清理恢复记录。
     if args.get(8).is_some_and(|v| v == "--confirm") {
-        engine.confirm(&store, &receipt).await?;
+        engine.confirm(&receipt).await?;
     }
     Ok(())
 }

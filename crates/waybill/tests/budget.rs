@@ -11,13 +11,15 @@ use waybill::{
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceId, ServiceIdentity},
     source::{Source, SourceIdentity},
-    upload::{
-        ConflictPolicy, RunOptions, SessionStatus, StopToken, UploadEngine, UploadIntent,
-        UploadPolicy, UploadSink,
-    },
+    transfer::{ConflictPolicy, StopToken, TransferEngine},
+    upload::{SessionStatus, UploadIntent, UploadOptions, UploadPolicy, UploadSink},
 };
 struct Pending;
 impl Source for Pending {
+    fn max_read_size(&self) -> usize {
+        32 * 1024 * 1024
+    }
+
     fn identity(&self) -> BoxFuture<'_, SourceIdentity> {
         Box::pin(std::future::pending())
     }
@@ -27,6 +29,13 @@ impl Source for Pending {
 }
 struct Sink;
 impl UploadSink for Sink {
+    fn chunk_limits(&self) -> waybill::upload::UploadChunkLimits {
+        waybill::upload::UploadChunkLimits {
+            max_size: 32 * 1024 * 1024,
+            alignment: 1,
+        }
+    }
+
     fn identity(&self) -> ServiceIdentity {
         ServiceIdentity {
             service: ServiceId::parse("example:sink").unwrap(),
@@ -98,30 +107,30 @@ fn unsupported() -> Error {
 fn shared_budget_rejects_overcommit_and_releases_on_future_drop() {
     let budget = Arc::new(ResourceBudget::new(256 * 1024, 1).unwrap());
     assert_eq!(budget.max_data_bytes(), 256 * 1024);
-    let engine = UploadEngine::new(budget.clone());
-    let other = UploadEngine::new(budget);
+    let engine = TransferEngine::new(Store).with_budget(budget.clone());
+    let other = TransferEngine::new(Store).with_budget(budget);
     let stop = StopToken::default();
     let progress = |_| {};
-    let options = || RunOptions {
+    let options = || UploadOptions {
         intent: UploadIntent {
             operation: "budget-test".into(),
             target: "file".into(),
             conflict: ConflictPolicy::Reject,
         },
         policy: UploadPolicy::default(),
-        stop: &stop,
-        progress: &progress,
+        stop: stop.clone(),
+        progress: Some(&progress),
     };
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
-    let mut first = Box::pin(engine.run(&Pending, &Sink, &Store, options()));
+    let mut first = Box::pin(engine.upload(&Pending, &Sink, options()));
     assert!(first.as_mut().poll(&mut context).is_pending());
-    let mut second = Box::pin(other.run(&Pending, &Sink, &Store, options()));
+    let mut second = Box::pin(other.upload(&Pending, &Sink, options()));
     assert!(
         matches!(second.as_mut().poll(&mut context),Poll::Ready(Err(e)) if e.kind==ErrorKind::ResourceBusy)
     );
     drop(first);
-    let mut third = Box::pin(other.run(&Pending, &Sink, &Store, options()));
+    let mut third = Box::pin(other.upload(&Pending, &Sink, options()));
     assert!(third.as_mut().poll(&mut context).is_pending());
 }
 #[test]
@@ -143,4 +152,32 @@ fn namespace_identifiers_are_open_and_validated() -> Result<()> {
     assert!("waybill:fs".parse::<ServiceId>().is_ok());
     assert!("bad".parse::<ServiceId>().is_err());
     Ok(())
+}
+
+#[test]
+fn target_references_are_interpreted_by_services_not_native_path_rules() {
+    assert!(
+        waybill::UploadOptions::new("upload", r"bucket\object")
+            .intent
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        waybill::DownloadOptions::new("download", "urn:target:file")
+            .intent
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        waybill::UploadOptions::new("invalid", "")
+            .intent
+            .validate()
+            .is_err()
+    );
+    assert!(
+        waybill::DownloadOptions::new("invalid", "file\nname")
+            .intent
+            .validate()
+            .is_err()
+    );
 }

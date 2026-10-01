@@ -133,33 +133,34 @@ refresh_token / client_secret 与交互授权由宿主拥有，同一凭证只�
 
 ### 5.1 访问面与双向交付面
 
-访问面负责 stat / list / range_read 等对象操作，交付面围绕 **Source、Sink、
-Transfer** 组织。上传和下载共用恢复、取消、进度与资源调度逻辑；具体的数据
-顺序由源 / 目标能力决定。以下上传 API 是契约草图，名称与签名尚未确定：
+访问面由具体 service 提供对象查询、目录列表与范围读取；交付面围绕明确的
+源、目标与 `TransferEngine` 组织。引擎持有 checkpoint 存储与共享预算，上传、
+下载分别通过 `upload` / `download` 开始或恢复，完成后统一通过 `confirm` 清理。
+无需 Operator、registry 或运行时后端枚举；宿主直接注入已构造的公开端口。
 
 ```rust
-// 访问面：熟面孔，覆盖 OpenDAL 的用法；凭证不吃静态 token，吃租约
-let service = Gdrive::builder()
-    .credentials(cred_provider)   // 每个请求获取有效的短期凭证
-    .root(folder_id)               // Drive 根目录由对象 ID 表达
-    .build()?;
-let op = Operator::from_service(Arc::new(service));
-let meta = op.stat(&object_ref).await?;
-let bytes = op.range_read(&object_ref, 1024..2048).await?;
+use waybill::{TransferEngine, UploadOptions, DownloadOptions};
 
-// 上传交付面：调用方提供通用操作 ID，不嵌入 SwarmDrop 设备 / 会话模型
-let session = op.publish()
-    .receipt(operation_id)                                     // 后端支持时查重对账
-    .content_hash(blake3_root)                                  // 完整性锚点
-    .staged(&staged_file)                                       // 本地暂存的区间读
-    .progress(&sink)
-    .start()                    // 先查重：receipt 命中 → 直接返回已完成对象
-    .await?;
-let state = session.checkpoint();   // 不透明、可序列化、由调用方 0600 落盘
-// ……进程崩溃……
-let session = op.publish().restore(state, &staged_file).await?;  // 先对账 committed 区间
-let object = session.complete().await?;                          // 远端确认完成
+let engine = TransferEngine::new(checkpoint_store);
+let uploaded = engine.upload(source.as_ref(), sink.as_ref(),
+    UploadOptions::new("stable-upload-operation", "backup/file.zip")).await?;
+let downloaded = engine.download(remote.as_ref(), local.as_ref(),
+    DownloadOptions::new("stable-download-operation", "/absolute/file.zip")).await?;
+// 宿主先提交业务账本，再分别 engine.confirm(&receipt).await?。
 ```
+
+选项构造器默认拒绝同名目标、不重建过期会话、不订阅进度。需要取消或进度时，
+宿主通过 `options.stop` 与 `options.progress` 显式接入；`StopToken` 是可克隆的
+共享停止信号，回调引用只在调用期间借用，不要求宿主先建立后台事件任务。
+CLI 的有界事件通道属于宿主，核心不强制绑定 UI 或异步消息通道。
+
+`transfer` 拥有引擎资源、回执、冲突策略与停止信号；`content` 拥有摘要与验证
+证据。`upload` 与 `download` 各自拥有意图、进度、端口和状态机，互不引用
+对方的类型。共享确认逻辑不依赖传输方向。
+
+稳定上传 `Source` 的身份核验包含完整内容摘要，宿主冻结源；云端
+`DownloadSource` 的身份核验查询当前版本，宿主不冻结远端对象。两者具有
+不同的成本与一致性责任，因此保留两个明确端口，不强行合并为一种 reader。
 
 checkpoint 由公共版本化信封与驱动私有状态组成：信封包含操作 ID、后端 / 账户
 命名空间、源身份与进度，驱动状态保存 session URI 或 upload_id / 分片列表。
@@ -341,22 +342,11 @@ core 私有模块、特殊分支或后门。外部开发者应能创建一个只
 - **写入模式分开扩展**：偏移、分片、整文件与本地随机写遵循各自契约。
   支持新后端可复用现有模式；出现新的传输语义时，通过演进核心契约承载。
 
-两种接入方式，以下为 API 草图，为长期规划，首期接口见 §11：
-
-```rust
-// Rust 应用直接使用外部 crate，只依赖公开 service 契约
-let service = Acme::builder().endpoint(endpoint).credentials(creds).build()?;
-let op = Operator::from_service(Arc::new(service));
-
-// CLI / 配置驱动宿主显式注册工厂，再从配置构造实例
-registry.register(ServiceId::parse("acme:object-store")?, AcmeFactory::new())?;
-let service = registry.build(&config, &host_context).await?;
-```
-
-直接注入是基础路径，不要求 registry。配置注册由可选的公开工厂接口支持，
-注册表归消费者所有，重复标识拒绝注册；不用进程全局隐式注册，不默认启用
-所有 service。首期通过 Rust crate 静态链接扩展，动态共享库 ABI 另行评估。
-工厂公开配置校验与版本信息，秘密以宿主引用或凭证接口注入。
+Rust 宿主直接构造具体 service，取得公开端口后注入 `TransferEngine`。
+最小只读 service 可只实现 `Service::source`，其余默认入口明确返回 Unsupported。
+动态后端选择由宿主通过 `Arc<dyn Service>` 完成；凭证接口属于具体 service。
+当前不提供 registry、配置工厂或动态共享库 ABI；出现实际配置宿主需求时再设计，
+不要求外部开发者先依赖尚不存在的统一访问包装。
 
 core、service 契约及公共信封使用明确的版本兼容规则，新增能力通过独立可选
 契约或兼容的默认 Unsupported 演进；稳定版破坏性修改提升主版本，0.x 阶段
@@ -485,21 +475,21 @@ capability 原样复制为所有交付能力。
   workspace，core 与各 service 独立成包；以 service-fs + service-gdrive
   验证上传恢复及外部接入，再按 GDrive 下载 → WebDAV → OSS 接入；OpenDAL 桥接按实际需求触发。
 - **checkpoint 状态格式**：不透明 blob 的版本化策略（库升级后旧 state 能否
-  restore）——首期公共信封与驱动均使用版本 1，未知版本拒绝恢复并保留记录。
+  restore）——当前公共信封为 v2，驱动版本独立；未知版本拒绝恢复并保留记录。
 - **校验与冲突策略**：来源缺少可信预期哈希时如何向消费者表达保证；同名目标
   的拒绝 / 覆盖 / 重命名规则；跨盘与外部文档提供方的发布回执如何对账。
 - **平台范围**：首期原生实现为 Linux / macOS；SAF / Web 适配时机与能力边界待定。
 - **公开扩展签名**：首期采用开放 trait 和 Send boxed future；工厂 / registry 后续设计。
-  0.x API 仍可演进，破坏性变更须升次版本并提供迁移说明。
+  项目未发布，允许直接调整公开 API；发布后再建立版本与迁移承诺。
 - **SwarmDrop 回切时机**：M1 后可评估局部接入，完整接入另立 OpenSpec 变更。
 
 ## 11. 首期落实契约与源码证据（2026-10-01）
 
 本节描述 M1 与 M2 的实现约束；M1 已通过真机验收，M2 的真实 Drive 下载与恢复也已验收。
-§5 中 Operator / registry 等草图属于长期设计，不是既有 API。
+当前公共入口为 `TransferEngine`；§5.1 与 service 开发指南使用同一套实际签名。
 
 - 核心定义开放 Service、Source、UploadSink、CheckpointStore、资源预算与上传、下载
-  状态机。公共异步返回 Send boxed future，不绑定 Tokio、HTTP、本地路径或应用身份；
+  状态机；由同一个 `TransferEngine` 持有存储与预算。公共异步返回 Send boxed future，不绑定 Tokio、HTTP、本地路径或应用身份；
   引擎内并发调度仅引入执行器无关的 futures-util，运行时仍归宿主。
 - service-fs 提供稳定文件源、精确范围读取、BLAKE3 身份、文件 checkpoint，以及下载
   本地目标（独占 `.part` 随机写、MD5 / BLAKE3 校验、同盘无覆盖发布）。宿主必须在上传期间
@@ -517,6 +507,25 @@ capability 原样复制为所有交付能力。
 - 文件 checkpoint 以 0600 临时文件、同步、替换、目录同步落盘；操作锁覆盖整个
   恢复和确认过程。源、凭证、私有状态不写 Debug / 日志。hash 属性是操作对账证据，
   不证明远端内容完整性，也不承诺跨进程并发同名目标的统一原子发布。
+
+### 公开 API 架构复核（2026-10-02）
+
+- `TransferEngine::new(store)` 接受具体存储或 `Arc<dyn CheckpointStore>`；引擎克隆
+  共享存储与预算，不克隆持久数据。`with_budget` 可在多个引擎间显式共享预算。
+- 上传源声明 `max_read_size`，上传目标声明 `UploadChunkLimits`（上限与非末块
+  对齐）；下载源和目标分别声明读写上限。引擎取预算与端口限制的有效交集，
+  对齐不足或零上限在准备对象 / 暂存前拒绝。Drive 的 8 MiB / 256 KiB 约束
+  属于 service 声明，核心不包含 Drive 名称或协议分支。
+- 上传与下载意图的 `target` 都是目标 service 解释的不透明引用。核心只检查操作 ID、
+  引用长度与控制字符；相对云端路径规则归 service-gdrive，原生绝对路径与段约束归 service-fs。CLI 在授权前规范化
+  本地路径，Rust 宿主也须提供稳定绝对路径，避免工作目录变化改变恢复目标。
+- 实例、稳定源与云端源的身份在开始 / 恢复时统一验证；账户、应用与根目录
+  继续隔离恢复命名空间。根目录约束路径解析，不能替代服务端权限检查。
+- 下载账本校验由 `DownloadFlow::persisted_bytes` 共用；恢复引擎与 CLI status
+  都拒绝越界、反向、重叠或过多区间，不能对损坏数据直接做减法和求和。
+  已完成下载在本地对账后也再次复核远端版本，版本变化保留记录并返回 SourceChanged。
+- 生命周期仍要求先保存决定再执行外部写入、同步数据后记账、保存完成回执后
+  报告成功。对账与失败处理保留各方向独立状态机，不以通用 writer 隐藏差异。
 
 ### CLI 宿主边界
 
@@ -575,10 +584,12 @@ service-fs 私有目标状态版本为 v2。每次初始化用 `tempfile` 在目
 长度，并按 `Verification` 声明实际证据。发布失败重跑不重新读取云端数据，
 但重新核验本地内容后再发布。
 
-checkpoint 信封升 v2：`flow` 标签区分上传 / 下载记录，v1 平铺上传记录由
-service-fs 存储层在解码前包一层上传流兼容加载，下次保存升级；两种方向共用
-同一操作租约与存储目录。回执新增 `verified` 验证级别；上传回执携带源
-BLAKE3 证据，下载回执按实际校验声明。
+checkpoint 信封采用 v2：`flow` 标签区分上传 / 下载记录，两种方向共用
+同一操作租约与存储目录。未发布阶段不维护 v1 平铺格式的兼容包装；旧记录
+拒绝解码并保留，未知信封版本拒绝恢复。驱动私有状态仍独立验证版本。
+回执 `verified` 只声明实际证据：GDrive 上传核对远端长度与身份属性，声明
+`Length`；客户端写入的 BLAKE3 属性不是 Google 内容校验结果。下载按真实
+MD5 / BLAKE3 或长度校验声明，源内容摘要继续作为上传恢复身份保存。
 
 service-gdrive 下载侧：`files/{id}?alt=media` 精确 Range 读取（206 必须精确
 回显区间；200 仅接受全文件请求，超长即协议错误；416 映射 SourceChanged）。
@@ -619,7 +630,7 @@ secret。`drive add / use / root / list / remove` 管理配置，root 未给 ID 
 选择器，不解释为递归下载。无参数 `list` 浏览根目录，提供路径时输出列表。
 
 `cmd::browse` 拥有网络 / 本地目录读取与导航栈；`ui::picker` 只拥有终端输入
-和渲染，使用已有 ratatui / crossterm，RAII 恢复终端。Enter 导航，Space 多选，
+和渲染，使用 ratatui / crossterm。终端由命令会话统一拥有，RAII 恢复。Enter 导航，Space 多选，
 c 确认；不同目录的文件选择以真实对象 ID / 本地绝对路径保留。云端范围继续
 由 service 控制，浏览导航最多 32 层；本地单目录最多 10000 项，选中集合最多
 4096 项，超限明确拒绝。Google 原生文档不提供虚假的二进制下载选项。
@@ -629,6 +640,22 @@ c 确认；不同目录的文件选择以真实对象 ID / 本地绝对路径保
 通过对象 ID 构造 source，逐文件占用同一有界预算并发送独立索引事件；全部
 本地目标在开始前验证，同名映射拒绝，不隐式覆盖。恢复身份和默认操作 ID
 仍绑定实际 service 实例、对象版本与绝对目标；文件选择器不拥有恢复状态。
+
+
+### CLI 全屏会话与运单浏览（2026-10-02）
+
+`cmd::dispatch` 为每次命令创建惰性的 `ui::Session`，只在首帧进入 raw mode
+与 alternate screen。盘选择、本地和云端选择器、传输面板显式借用同一个会话；
+目录导航、等待网络和步骤切换保持全屏，命令结束或错误时恢复。输入使用
+crossterm `EventStream`，与传输事件通过 `tokio::select!` 驱动，没有阻塞输入线程
+或进程级 UI 资源槽。直接使用 ratatui / crossterm，移除会自行初始化和恢复
+终端的 ratatui-kit 运行时，避免多套终端所有权。
+
+`cmd::status` 扫描公共 checkpoint 信封并提供安全展示行；`ui::status` 负责
+只读列表、详情、读取问题和手动刷新。刷新保留选中操作，不取写租约、不请求
+云端或擅自恢复任务。TUI 默认仅在三个标准流均为终端时启用；`--no-tui`
+与非终端保持行式输出，`--json` 保持原有 JSON 数组。存在不可读取记录仍返回
+非零退出码，离开全屏后输出诊断，不能让不完整结果伪装成成功。
 
 
 抽取基线：SwarmDrop `0a81f133214958f7b01ae9a0e4624dc87e16014b`，

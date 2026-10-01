@@ -17,7 +17,7 @@ use credential::TokenProvider;
 use std::sync::Arc;
 use waybill::{
     BoxFuture,
-    download::{DownloadSource, DownloadTarget},
+    download::DownloadSource,
     error::{Error, ErrorKind, Result},
     service::{Service, ServiceId, ServiceIdentity, ServiceInfo},
     upload::UploadSink,
@@ -87,12 +87,6 @@ impl Service for Gdrive {
             let media = self.media(reference)?;
             Ok(Arc::new(media) as Arc<dyn DownloadSource>)
         })
-    }
-    fn download_target(&self) -> Result<Arc<dyn DownloadTarget>> {
-        Err(Error::new(
-            ErrorKind::Unsupported,
-            "download target unavailable",
-        ))
     }
 }
 #[cfg(test)]

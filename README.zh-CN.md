@@ -91,6 +91,10 @@ wb status                     # 查看在途记录与完成回执
 选择器中，Enter 进入目录，Space 选择文件，`c` 确认，← / Backspace 返回上级，
 `q` / Esc / Ctrl-C 取消。文件选择跨目录保留。
 
+`wb status` 在终端默认打开本机运单面板：Enter / `d` 查看详情，`r` 刷新，
+`e` 查看读取问题（↑↓ 翻阅），`q` 退出。`wb status --no-tui` 输出列表，
+`wb --json status` 输出 JSON 数组。选择器与传输面板共用全屏会话，步骤切换不退出终端。
+
 传输时默认显示全屏面板；`--no-tui` 使用行式输出。首次 Ctrl-C 优雅停止，
 再次 Ctrl-C 立即中止。保留源文件、盘配置与本机记录，重跑同一命令即可恢复。
 
@@ -136,6 +140,13 @@ Google 原生文档可浏览，但不支持导出下载；目录不做递归下�
 | [`waybill-service-fs`](crates/waybill-service-fs/) | 稳定本地源、文件 checkpoint、下载暂存与发布 |
 | [`waybill-service-gdrive`](crates/waybill-service-gdrive/) | Google Drive 协议、上传会话对账、范围读取与目录访问 |
 | [`waybill-cli`](crates/waybill-cli/) | `wb`：授权、盘配置、交互与传输编排 |
+
+```rust
+let engine = waybill::TransferEngine::new(checkpoint_store);
+let receipt = engine.upload(source.as_ref(), sink.as_ref(),
+    waybill::UploadOptions::new("stable-operation-id", "backup/file.zip")).await?;
+// 宿主先提交业务账本，再调用 engine.confirm(&receipt)。
+```
 
 核心不绑定具体后端或执行器。宿主负责授权与凭证刷新，service 在请求边界获取有效凭证。
 外部 service 与仓库内 service 使用相同公开接口，按实际能力实现上传、下载与恢复。

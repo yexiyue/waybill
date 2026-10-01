@@ -1,78 +1,32 @@
 //! 上传状态机：远端对账先于继续发送，完成回执先于成功返回。
+use crate::transfer::{ConflictPolicy, Receipt, StopToken, TransferEngine, valid_operation};
 use crate::{
     BoxFuture,
-    budget::ResourceBudget,
-    checkpoint::{Checkpoint, CheckpointStore, DriverState, Flow, UploadFlow},
-    download::Verification,
+    checkpoint::{Checkpoint, DriverState, Flow, UploadFlow},
     error::{Error, ErrorKind, Result},
     service::{Capabilities, ServiceIdentity},
     source::{Source, SourceIdentity},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 
-/// 目标冲突策略；不同进程对同名对象不具备跨进程原子隔离。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConflictPolicy {
-    /// 默认拒绝同名目标。
-    #[default]
-    Reject,
-    /// 冲突时添加稳定操作后缀，不覆盖其他对象。
-    OperationSuffix,
-}
 /// 消费者指定的通用上传意图，不包含设备或接收会话。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadIntent {
     /// 持久稳定的操作 ID；同一操作不得更换源或目标。
     pub operation: String,
-    /// 相对于 service 根目录的目标路径。
+    /// 目标 service 解释的对象引用；GDrive 使用相对根目录的路径。
     pub target: String,
     /// 同名目标策略。
     pub conflict: ConflictPolicy,
 }
 impl UploadIntent {
-    /// 校验有界操作标识和目标路径。
+    /// 校验有界操作标识和目标引用。
     pub fn validate(&self) -> Result<()> {
-        if !valid_operation(&self.operation) || !crate::object::valid_object_path(&self.target) {
+        if !valid_operation(&self.operation) || !crate::object::valid_reference(&self.target) {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid upload intent"));
         }
         Ok(())
     }
-}
-/// 操作标识：1..=128 字节的 ASCII 字母数字与 `-_.:`。
-pub(crate) fn valid_operation(operation: &str) -> bool {
-    !operation.is_empty()
-        && operation.len() <= 128
-        && operation
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
-}
-/// BLAKE3 小写十六进制摘要（64 字符）。
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-/// 持久完成证据；消费者记账后以同一回执确认清理。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Receipt {
-    /// 操作身份。
-    pub operation: String,
-    /// 目标实例。
-    pub service: ServiceIdentity,
-    /// 目标相对路径。
-    pub target: String,
-    /// 后端实际对象引用。
-    pub object: String,
-    /// 远端确认长度。
-    pub size: u64,
-    /// 交付内容的验证证据；v1 回执按未验证兼容解码。
-    #[serde(default)]
-    pub verified: Verification,
 }
 /// 服务端对账结果；每次状态更新都需持久化。
 #[derive(Debug)]
@@ -96,8 +50,41 @@ pub enum SessionStatus {
         receipt: Receipt,
     },
 }
+/// 连续偏移上传的块大小约束；末块不要求对齐。
+#[derive(Debug, Clone, Copy)]
+pub struct UploadChunkLimits {
+    /// 单块最大字节数，必须非零。
+    pub max_size: usize,
+    /// 非末块长度的倍数，必须非零且不大于 max_size。
+    pub alignment: usize,
+}
+impl UploadChunkLimits {
+    fn select(self, budget: usize, source: usize) -> Result<usize> {
+        if self.max_size == 0
+            || self.alignment == 0
+            || self.alignment > self.max_size
+            || source == 0
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid upload chunk limits",
+            ));
+        }
+        let size = budget.min(source).min(self.max_size);
+        let aligned = size - size % self.alignment;
+        if aligned == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "budget below upload alignment",
+            ));
+        }
+        Ok(aligned)
+    }
+}
 /// 连续偏移上传契约；驱动不拥有核心调度或 checkpoint IO。
 pub trait UploadSink: Send + Sync {
+    /// 当前后端的上传块约束；末块可小于对齐长度。
+    fn chunk_limits(&self) -> UploadChunkLimits;
     /// 稳定实例身份。
     fn identity(&self) -> ServiceIdentity;
     /// 实际能力。
@@ -132,19 +119,6 @@ pub trait UploadSink: Send + Sync {
         data: Vec<u8>,
     ) -> BoxFuture<'a, SessionStatus>;
 }
-/// 显式暂停信号；丢弃 run future 同样保留最近持久 checkpoint。
-#[derive(Clone, Default)]
-pub struct StopToken(Arc<AtomicBool>);
-impl StopToken {
-    /// 停止安排后续块；不会删除源、checkpoint 或远端对象。
-    pub fn stop(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-    /// 是否已请求停止。
-    pub fn is_stopped(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
 /// 上传恢复策略。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UploadPolicy {
@@ -153,7 +127,7 @@ pub struct UploadPolicy {
 }
 /// 不将发送、确认、持久化和完成混为一谈的进度。
 #[derive(Debug, Clone, Copy)]
-pub struct Progress {
+pub struct UploadProgress {
     /// 本次运行尝试发送字节数，可因重传超过文件长度。
     pub sent: u64,
     /// 已持久化的服务端确认字节数；引擎只在 checkpoint 落盘后上报，
@@ -167,40 +141,53 @@ pub struct Progress {
     pub complete: bool,
 }
 /// 单次上传的意图、策略与宿主控制端口。
-pub struct RunOptions<'a> {
+pub struct UploadOptions<'a> {
     /// 稳定上传意图。
     pub intent: UploadIntent,
     /// 显式恢复策略。
     pub policy: UploadPolicy,
     /// 宿主暂停信号。
-    pub stop: &'a StopToken,
+    pub stop: StopToken,
     /// 有界同步通知；回调不能阻塞或保存数据缓冲。
-    pub progress: &'a (dyn Fn(Progress) + Send + Sync),
+    pub progress: Option<&'a (dyn Fn(UploadProgress) + Send + Sync)>,
 }
-/// 只依赖公开端口的上传引擎。
-pub struct UploadEngine {
-    budget: Arc<ResourceBudget>,
-}
-impl UploadEngine {
-    /// 注入共享预算；跨 service 实例共享同一个 Arc 才有统一上界。
-    pub fn new(budget: Arc<ResourceBudget>) -> Self {
-        Self { budget }
+impl<'a> UploadOptions<'a> {
+    /// 使用稳定操作 ID 与目标路径创建默认选项；开始传输时统一校验。
+    /// 默认拒绝同名目标，不暂停且不订阅进度。
+    pub fn new(operation: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            intent: UploadIntent {
+                operation: operation.into(),
+                target: target.into(),
+                conflict: ConflictPolicy::Reject,
+            },
+            stop: StopToken::default(),
+            progress: None,
+            policy: UploadPolicy::default(),
+        }
     }
+}
+impl TransferEngine {
     /// 开始或恢复上传。源在整个调用期间必须不可变。
-    pub async fn run(
+    pub async fn upload(
         &self,
         source: &dyn Source,
         sink: &dyn UploadSink,
-        store: &dyn CheckpointStore,
-        options: RunOptions<'_>,
+        options: UploadOptions<'_>,
     ) -> Result<Receipt> {
-        let RunOptions {
+        let UploadOptions {
             intent,
             policy,
             stop,
             progress,
         } = options;
+        let progress = progress.unwrap_or(&|_| {});
+        if stop.is_stopped() {
+            return Err(Error::new(ErrorKind::Paused, "upload paused"));
+        }
         intent.validate()?;
+        let service = sink.identity();
+        service.validate()?;
         let caps = sink.capabilities();
         if !caps.offset_upload || !caps.durable_upload {
             return Err(Error::new(
@@ -208,18 +195,19 @@ impl UploadEngine {
                 "durable offset upload required",
             ));
         }
+        let chunk_size = sink
+            .chunk_limits()
+            .select(self.budget.chunk_size(), source.max_read_size())?;
         let _permit = self.budget.acquire()?;
-        let lease = store.acquire(&intent.operation).await?;
+        let lease = self.store.acquire(&intent.operation).await?;
         if stop.is_stopped() {
             return Err(Error::new(ErrorKind::Paused, "upload paused"));
         }
         let identity = source.identity().await?;
-        if !valid_digest(&identity.blake3) {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid source digest"));
-        }
+        identity.validate()?;
         let mut flow = match lease.load().await? {
             Some(saved) => {
-                if !Checkpoint::supported(saved.version, &saved.flow) {
+                if !Checkpoint::supported(saved.version) {
                     return Err(Error::new(
                         ErrorKind::IncompatibleVersion,
                         "checkpoint version",
@@ -227,7 +215,7 @@ impl UploadEngine {
                 }
                 match saved.flow {
                     Flow::Upload(flow) => {
-                        if flow.intent != intent || flow.service != sink.identity() {
+                        if flow.intent != intent || flow.service != service.clone() {
                             return Err(Error::new(
                                 ErrorKind::IdentityMismatch,
                                 "checkpoint binding",
@@ -256,7 +244,7 @@ impl UploadEngine {
                 let driver = sink.prepare(&intent, &identity).await?;
                 let flow = UploadFlow {
                     intent,
-                    service: sink.identity(),
+                    service: service.clone(),
                     source: identity,
                     acknowledged: 0,
                     restarts: 0,
@@ -368,8 +356,7 @@ impl UploadEngine {
                             "all bytes confirmed without completion",
                         ));
                     }
-                    let length =
-                        (flow.source.size - offset).min(self.budget.chunk_size() as u64) as usize;
+                    let length = (flow.source.size - offset).min(chunk_size as u64) as usize;
                     let data = source.read_range(offset, length).await?;
                     if data.len() != length {
                         return Err(Error::new(ErrorKind::Protocol, "short source range"));
@@ -422,26 +409,9 @@ impl UploadEngine {
             }
         }
     }
-    /// 消费者已提交业务记账后，以准确回执删除 checkpoint；源文件不受影响。
-    pub async fn confirm(&self, store: &dyn CheckpointStore, receipt: &Receipt) -> Result<()> {
-        let lease = store.acquire(&receipt.operation).await?;
-        if let Some(checkpoint) = lease.load().await? {
-            if !Checkpoint::supported(checkpoint.version, &checkpoint.flow) {
-                return Err(Error::new(
-                    ErrorKind::IncompatibleVersion,
-                    "checkpoint version",
-                ));
-            }
-            if checkpoint.upload().and_then(|flow| flow.receipt.as_ref()) != Some(receipt) {
-                return Err(Error::new(ErrorKind::IdentityMismatch, "receipt mismatch"));
-            }
-            lease.remove().await?;
-        }
-        Ok(())
-    }
 }
-fn report(flow: &UploadFlow, sent: u64, progress: &(dyn Fn(Progress) + Send + Sync)) {
-    progress(Progress {
+fn report(flow: &UploadFlow, sent: u64, progress: &(dyn Fn(UploadProgress) + Send + Sync)) {
+    progress(UploadProgress {
         sent,
         persisted: flow.acknowledged,
         total: flow.source.size,

@@ -5,13 +5,12 @@ use waybill::{
     BoxFuture,
     budget::ResourceBudget,
     checkpoint::{Checkpoint, CheckpointLease, CheckpointStore, Flow},
-    download::{
-        Digest, DigestAlgorithm, DownloadEngine, DownloadIntent, DownloadOptions, DownloadProgress,
-        DownloadSource, DownloadStatus, Verification,
-    },
+    content::{Digest, DigestAlgorithm, Verification},
+    download::{DownloadIntent, DownloadOptions, DownloadProgress, DownloadSource, DownloadStatus},
     error::{Error, ErrorKind},
     service::{Capabilities, Service, ServiceId, ServiceIdentity},
-    upload::{ConflictPolicy, Receipt, StopToken},
+    transfer::TransferEngine,
+    transfer::{ConflictPolicy, Receipt, StopToken},
 };
 use waybill_service_fs::{FileCheckpointStore, FsService};
 
@@ -58,6 +57,10 @@ impl PatternSource {
     }
 }
 impl DownloadSource for PatternSource {
+    fn max_read_size(&self) -> usize {
+        32 * 1024 * 1024
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             range_download: true,
@@ -90,8 +93,13 @@ fn intent(operation: &str, dest: &std::path::Path) -> DownloadIntent {
         conflict: ConflictPolicy::Reject,
     }
 }
-fn engine(chunk: usize, concurrency: usize) -> DownloadEngine {
-    DownloadEngine::new(Arc::new(ResourceBudget::new(chunk, concurrency).unwrap()))
+fn engine(
+    chunk: usize,
+    concurrency: usize,
+    store: impl CheckpointStore + 'static,
+) -> TransferEngine {
+    TransferEngine::new(store)
+        .with_budget(Arc::new(ResourceBudget::new(chunk, concurrency).unwrap()))
 }
 async fn run(
     size: u64,
@@ -104,15 +112,14 @@ async fn run(
     let source = PatternSource::new(size);
     let target = service().download_target().unwrap();
     let store = FileCheckpointStore::new(checkpoints);
-    engine(16, 2)
-        .run(
+    engine(16, 2, store.clone())
+        .download(
             &source,
             target.as_ref(),
-            &store,
             DownloadOptions {
                 intent: intent(operation, dest),
-                stop,
-                progress,
+                stop: stop.clone(),
+                progress: Some(progress),
             },
         )
         .await
@@ -172,7 +179,10 @@ async fn engine_publishes_verified_content_and_removes_staging() {
     assert!(staging_paths(&dest).is_empty(), "暂存必须已发布");
     // confirm 后记录清除。
     let store = FileCheckpointStore::new(dir.path().join("cp"));
-    engine(16, 2).confirm(&store, &receipt).await.unwrap();
+    engine(16, 2, store.clone())
+        .confirm(&receipt)
+        .await
+        .unwrap();
     assert!(
         std::fs::read_dir(dir.path().join("cp")).unwrap().count() >= 1,
         "锁文件保留"
@@ -239,17 +249,16 @@ async fn part_length_is_not_completion_evidence() {
     assert_eq!(std::fs::metadata(&part).unwrap().len(), 48);
     let store = FileCheckpointStore::new(dir.path().join("cp"));
     let reads = std::sync::atomic::AtomicUsize::new(0);
-    let receipt = engine(16, 1)
-        .run(
+    let receipt = engine(16, 1, store.clone())
+        .download(
             &source,
             target.as_ref(),
-            &store,
             DownloadOptions {
                 intent: preset_intent,
-                stop: &StopToken::default(),
-                progress: &|_| {
+                stop: StopToken::default(),
+                progress: Some(&|_| {
                     reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                },
+                }),
             },
         )
         .await
@@ -388,15 +397,14 @@ async fn operation_suffix_publishes_to_a_stable_suffixed_name() {
         target: dest.to_string_lossy().into_owned(),
         conflict: ConflictPolicy::OperationSuffix,
     };
-    let receipt = engine(16, 2)
-        .run(
+    let receipt = engine(16, 2, store.clone())
+        .download(
             &source,
             target.as_ref(),
-            &store,
             DownloadOptions {
                 intent: suffixed_intent.clone(),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
@@ -407,15 +415,14 @@ async fn operation_suffix_publishes_to_a_stable_suffixed_name() {
     assert_ne!(published, dest);
     assert_eq!(std::fs::read(&published).unwrap(), expected_bytes(100));
     // 重跑幂等：对账后缀名目标并返回原回执。
-    let again = engine(16, 2)
-        .run(
+    let again = engine(16, 2, store.clone())
+        .download(
             &source,
             target.as_ref(),
-            &store,
             DownloadOptions {
                 intent: suffixed_intent,
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
@@ -479,15 +486,14 @@ async fn publish_window_reconciles_destination_after_receipt_loss() {
     let target = service().download_target().unwrap();
     let failing = FileCheckpointStore::new(&checkpoints);
     // 直接以真实存储驱动但拦截带回执保存：发布成功、回执未落盘。
-    let first = engine(16, 2)
-        .run(
+    let first = engine(16, 2, FailingProbe { inner: failing })
+        .download(
             &source,
             target.as_ref(),
-            &FailingProbe { inner: failing },
             DownloadOptions {
                 intent: intent("window-op", &dest),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await;
@@ -735,15 +741,14 @@ async fn conflict_suffix_uses_file_name_in_dotted_parent_directory() {
     let store = FileCheckpointStore::new(dir.path().join("cp"));
     let mut request = intent("dotted-op", &dest);
     request.conflict = ConflictPolicy::OperationSuffix;
-    let receipt = engine(16, 2)
-        .run(
+    let receipt = engine(16, 2, store.clone())
+        .download(
             &source,
             target.as_ref(),
-            &store,
             DownloadOptions {
                 intent: request,
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
@@ -846,6 +851,10 @@ async fn hardlink_publish_window_reconciles_without_remote_reads() {
         reads: std::sync::atomic::AtomicUsize,
     }
     impl DownloadSource for MetadataOnlySource {
+        fn max_read_size(&self) -> usize {
+            32 * 1024 * 1024
+        }
+
         fn capabilities(&self) -> Capabilities {
             self.inner.capabilities()
         }
@@ -869,15 +878,14 @@ async fn hardlink_publish_window_reconciles_without_remote_reads() {
     };
     let target = service().download_target().unwrap();
     let store = FileCheckpointStore::new(&checkpoints);
-    let receipt = engine(16, 2)
-        .run(
+    let receipt = engine(16, 2, store.clone())
+        .download(
             &source,
             target.as_ref(),
-            &store,
             DownloadOptions {
                 intent: intent("linked-op", &dest),
-                stop: &StopToken::default(),
-                progress: &|_| {},
+                stop: StopToken::default(),
+                progress: Some(&|_| {}),
             },
         )
         .await
