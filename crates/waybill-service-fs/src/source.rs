@@ -6,6 +6,7 @@ use tokio::{
 };
 use waybill::{
     BoxFuture,
+    download::DownloadTarget,
     error::{Error, ErrorKind, Result},
     service::{Capabilities, Service, ServiceId, ServiceIdentity, ServiceInfo},
     source::{Source, SourceIdentity},
@@ -129,12 +130,19 @@ impl Service for FsService {
             identity: self.identity.clone(),
             capabilities: Capabilities {
                 range_source: true,
+                random_write: true,
+                durable_publish: true,
                 ..Capabilities::default()
             },
         }
     }
     fn source<'a>(&'a self, reference: &'a str) -> BoxFuture<'a, Arc<dyn Source>> {
         Box::pin(async move { Ok(Arc::new(FileSource::open(reference).await?) as Arc<dyn Source>) })
+    }
+    fn download_target(&self) -> Result<Arc<dyn DownloadTarget>> {
+        Ok(Arc::new(crate::target::LocalTarget::new(
+            self.identity.clone(),
+        )))
     }
 }
 async fn hash(file: &mut tokio::fs::File) -> Result<String> {

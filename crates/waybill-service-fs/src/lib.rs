@@ -6,5 +6,7 @@
 compile_error!("waybill-service-fs currently supports Linux and macOS only");
 mod checkpoint;
 mod source;
+mod target;
 pub use checkpoint::{FileCheckpointStore, decode_checkpoint};
 pub use source::{FileSource, FsService};
+pub use target::LocalTarget;

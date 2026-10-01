@@ -179,7 +179,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
         .await
         .map_err(|e| Error::new(ErrorKind::Checkpoint, "checkpoint worker").with_source(e))?
 }
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|f| f.sync_all())
         .map_err(io_error)
