@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/waybill"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yexiyue/waybill"
+rust-version = "1.85"
+
+# 带持久断点与回执幂等的云存储交付库（waybill / 运单）。
+# 设计文档见 docs/DESIGN.zh-CN.md；M0 阶段只立契约骨架，不提前实现后端。
+[profile.release]
+lto = "thin"
