@@ -1,110 +1,148 @@
 # waybill
 
+<p align="center">
+  <img src="assets/brand/readme-banner-v1.png" alt="waybill — Bill the courier goose with a waybill tube strapped to his leg" width="960">
+</p>
+
+<p align="center">
+  <strong>Resumable delivery. Both ways.</strong><br>
+  A Rust library for moving files between local storage and the cloud.
+</p>
+
+<p align="center">
+  <a href="README.zh-CN.md">简体中文</a> ·
+  <a href="docs/DESIGN.zh-CN.md">Design</a> ·
+  <a href="docs/BRAND.zh-CN.md">Meet Bill</a> ·
+  <a href="https://github.com/yexiyue/waybill/actions/workflows/ci.yml">CI</a>
+</p>
+
+> **Early development · M0 contract design.** This repository currently contains
+> a Rust workspace scaffold and design documentation. There is no public transfer
+> API, implemented service, or crates.io release yet. The capabilities below
+> describe the intended design.
+
+## Delivery that can pick up where it stopped
+
+A large transfer can outlive its process. A connection drops, an app restarts,
+or the destination becomes unavailable just as the file is ready to publish.
+waybill is being designed to preserve enough state to continue safely.
+
+The name comes from a **waybill**: the document that travels with a shipment,
+recording its identity, progress, and delivery receipt.
+
+| Design goal | What it means |
+|---|---|
+| **Durable recovery** | Versioned checkpoints bind progress to a source and destination. Recovery reconciles persisted data or the remote session before continuing. |
+| **Receipt-based retries** | An operation ID and completion evidence help retries converge, within each service's guarantees. |
+| **Bounded resources** | Chunk sizes, concurrency, prefetch, and buffers share an explicit budget. |
+| **Honest capabilities** | Upload recovery, download recovery, version checks, and publishing guarantees are declared separately. |
+
+For downloads, the planned lifecycle is: read missing ranges, write a local
+.part file, persist confirmed progress, validate, then publish. A failed publish
+keeps staging data available for another attempt.
+
+For uploads, the service determines whether recovery uses a continuous offset,
+multipart state, or a full restart. A caller that requires durable recovery can
+reject an unsuitable service before starting.
+
+## One engine, independently implemented services
+
+```mermaid
+flowchart LR
+    LocalSource[Local file source] --> Engine[Transfer engine]
+    CloudSource[Cloud object source] --> Engine
+    Engine --> LocalSink[Local staging and publish]
+    Engine --> CloudSink[Cloud upload session]
+    Engine --> Checkpoint[Checkpoint store]
 ```
-       \\
-       (o>
-    \\_//)
-     \_/_)
-      _|_
-```
 
-**Reliable bidirectional delivery between local files and cloud storage.**
-Resumable transfers that survive crashes, retries that converge instead of
-duplicating, and publishes with atomic boundaries — as a Rust library.
+The planned core defines Service, Source, and Sink contracts, capabilities,
+checkpoints, credentials, and transfer scheduling. Each service implements a
+backend through those public contracts.
 
-> *waybill* (n.) 运单 — the document that accompanies a shipment: its receipt,
-> its tracking state, and its proof of delivery. The mascot is **Bill**, a
-> courier goose with a waybill tube on his leg — more on him below.
+**The services maintained here use the same extension boundary as services
+written by other developers.** An external service should be able to live in its
+own crate, depend on waybill, and be injected without adding a provider enum
+variant or changing the engine.
 
-## Why
+| Planned service | Role |
+|---|---|
+| waybill-service-fs | Local range reads, offset writes, staging, persistence, and final publication |
+| waybill-service-gdrive | Google Drive access and resumable upload sessions |
+| waybill-service-webdav | Streaming uploads, range downloads, and declared server capabilities |
+| waybill-service-oss | Aliyun OSS access, multipart sessions, and part reconciliation |
+| External service crates | Additional backends using the same public extension contracts |
 
-Rust has excellent *access* layers (OpenDAL, `object_store`): one API, many
-backends, operations assumed to complete within a process. It has **nothing**
-for the case every long-running app actually hits — the process dies
-mid-upload, the network drops, the user hits retry:
+A read-only service can participate without implementing uploads. Durable
+recovery is an optional contract with explicit requirements. Shared examples
+and capability-driven conformance tools are planned to make service development
+easier.
 
-| | Access layers (`opendal`, `object_store`) | `waybill` |
-|---|---|---|
-| Assumption | single-process operations | processes die, networks drop, users retry |
-| Core value | one API across backends | crash-safe resume, receipt-idempotent retry, atomic publish |
-| Backend differences | flattened away | **typed** in an honest capability matrix |
+See the [extension design](docs/DESIGN.zh-CN.md#57-第三方-service-的公开扩展契约).
+API names and signatures are still under design.
 
-The three requirements `waybill` exists to enforce:
+## Working with the Rust storage ecosystem
 
-1. **Receipt idempotency** — dedupe by a receipt key; a retry after a lost
-   completion response never creates a duplicate object; batch retries skip
-   already-delivered files.
-2. **Durable resume** — upload/download session state is serializable
-   (an opaque, versioned checkpoint the caller stores with 0600 discipline);
-   after a crash, reconcile the committed extent against the server before
-   continuing.
-3. **Bounded memory** — sources and sinks are read/written by precise ranges.
-   No unbounded buffers, ever.
+The design draws on access and multipart primitives from OpenDAL and
+object_store. Protocol clients, HTTP transports, and signing libraries can be
+reused while waybill owns the transfer lifecycle and its recovery state.
 
-A capability matrix types the degradation, so callers decide instead of
-assuming:
+An optional OpenDAL service may follow a concrete demand for another backend.
+Range reads and source-version checks can be combined with local checkpoints
+for download recovery. Upload-session recovery needs separate backend support.
 
-```text
-resume        : Durable (Drive resumable, OSS multipart) | Restart (plain
-                WebDAV: retransmit, but .part + MOVE keeps the publish atomic)
-                | Unsupported (bridged long tail)
-idempotency   : metadata receipt | deterministic key | server-side conditional
-atomic publish: rename | remote complete | copy — declared, not assumed
-```
+Each service declares its guarantees. A WebDAV MOVE, an object key, or an ETag
+alone does not establish universal atomicity, content integrity, or exactly-once
+delivery. The [design document](docs/DESIGN.zh-CN.md) records the research and
+proposed boundaries.
 
-Explicitly **not** goals: a bidirectional sync engine (unison/syncthing-style,
-see the design doc §2), an OpenDAL API compatibility layer, or multi-language
-bindings.
+The initial scope is file delivery between local and cloud storage. Directory
+sync, conflict merging, and multi-device synchronization are outside that scope.
 
 ## Roadmap
 
-| Milestone | Scope |
+| Milestone | Planned outcome |
 |---|---|
-| **M0** (now) | Open `Service` / `Source` / `Sink` contracts, capability model, checkpoint envelope, third-party service examples |
-| **M1** | `service-fs` + `service-gdrive`: full bidirectional chain — Drive object → local `.part` → crash → resume → publish |
-| **M2** | `service-webdav`: streamed upload, range download, real-server matrix (Synology / QNAP / Nutstore / Nextcloud) |
-| **M3** | `service-oss`: multipart, `ListParts` reconciliation, completion accounting |
-| later | optional `service-opendal` bridge for the long tail — honestly declared `Unsupported` where durable resume doesn't exist |
+| **M0 — current** | Public extension contracts, capabilities, checkpoint envelope, and minimal service examples |
+| **M1** | Local + Drive services; upload and download recovery; independent consumer integration |
+| **M2** | WebDAV service and a real-server compatibility matrix |
+| **M3** | OSS service; multipart recovery and completion reconciliation |
+| **On demand** | OpenDAL adapter, starting with a concrete additional backend and its download path |
 
-The full design — motivation, ecosystem survey, API sketches, the open
-extension contract for third-party services — lives in
-[docs/DESIGN.zh-CN.md](docs/DESIGN.zh-CN.md) (Chinese, English translation
-welcome as a contribution). The CLI market scan — why this doesn't fight
-rclone head-on — lives in
-[docs/market-cli.zh-CN.md](docs/market-cli.zh-CN.md).
+The first intended consumer is
+[SwarmDrop](https://github.com/swarm-apps/SwarmDrop). Its existing local-file and
+Drive delivery implementations provide the starting material. waybill's public
+contracts remain independent of its UI, device identity, and P2P protocol.
 
-## Bill, the courier goose
+## Meet Bill
 
-Bill migrates both ways every year (bidirectional transfer), refuels at the
-same wetlands (checkpoints), returns to the same nest (idempotent receipts),
-and flies in a V formation taking turns leading (concurrent parts). He is
-stubborn about not losing your package. 中文圈叫他**雁哥**.
+<p align="center">
+  <img src="assets/brand/bill-mascot-v1.png" alt="Bill, a cream-and-grey courier goose with an orange bill and a teal document tube on his leg" width="240">
+</p>
 
-## Status & license
+**Bill**, known as **雁哥** in Chinese, is our courier goose. His two-way migration
+fits the library's two-way delivery, and the tube on his leg keeps the waybill
+close throughout the journey.
 
-Pre-M0: contracts under design, no public API yet, not published to
-crates.io. Dual-licensed under MIT or Apache-2.0, at your option. First
-consumer: [SwarmDrop](https://github.com/yexiyue/SwarmDrop) — cross-network,
-end-to-end encrypted file transfer (the in-tree Drive/local delivery code is
-the seed this library generalizes).
+The [brand guide](docs/BRAND.zh-CN.md) includes the mascot, avatar, README banner,
+social cover, and generation prompts.
 
----
+## Contributing
 
-## 中文简介
+Start with the [design document](docs/DESIGN.zh-CN.md). Contributions around the
+public service boundary, recovery behavior, and real backend constraints are
+especially useful at this stage.
 
-**waybill（运单）**：云端与本地之间的可恢复双向传输库。
+The workspace uses **Rust 2024**, with a declared minimum Rust version of **1.85**.
+To check the current scaffold:
 
-- **回执幂等**：以回执键查重，完成响应丢失后的重试不产生重复对象；批量上传
-  部分失败，重试自动跳过已完成项。
-- **持久断点**：上传 / 下载会话状态可序列化（版本化信封 + 驱动私有状态），
-  崩溃重启后先对账服务端已确认区间再续传。
-- **内存上界**：源 / 目标一律区间读写，禁止无界缓冲。
-- **类型化降级**：恢复策略、幂等判据、发布保证都在能力矩阵上诚实声明，
-  能力不足在开始前明确拒绝，不静默降级。
+```sh
+cargo check --workspace
+```
 
-定位：OpenDAL / object_store 是「访问层」，waybill 是「交付层」——假设进程会死、
-网络会断、用户会重试。设计文档（动机、生态调研、API 草图、第三方 service
-开放契约）见 [docs/DESIGN.zh-CN.md](docs/DESIGN.zh-CN.md)。
+Please discuss a service's capabilities and recovery guarantees before building
+against the API sketches. The sketches are design material and may change.
 
-吉祥物 **Bill（雁哥）**：一只腿绑运单筒的邮差鸿雁——双向迁徙、湿地补给、
-年年归巢、雁阵领飞，分别对应双向传输、checkpoint、回执幂等与分片并发。
+## License
+
+Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
