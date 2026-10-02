@@ -57,15 +57,15 @@ obtain valid credentials at request boundaries.
 
 ## Library setup
 
-The project is 0.x, unpublished on crates.io, and public APIs may change. Add it
-as a git dependency; **Rust 1.91+** (edition 2024) is required. The services are
+Version 0.1.0 is available on crates.io; public APIs may change during 0.x.
+**Rust 1.91+** (edition 2024) is required. The services are
 native implementations, so hosts bring their own Tokio runtime:
 
 ```toml
 [dependencies]
-waybill = { git = "https://github.com/yexiyue/waybill" }
-waybill-service-fs = { git = "https://github.com/yexiyue/waybill" }
-waybill-service-gdrive = { git = "https://github.com/yexiyue/waybill" }
+waybill = "0.1.0"
+waybill-service-fs = "0.1.0"
+waybill-service-gdrive = "0.1.0"
 # add waybill-service-webdav / waybill-service-opendal as needed
 tokio = { version = "1", features = ["full"] }
 ```
@@ -261,12 +261,10 @@ the reference host integration.
 
 ### Installation
 
-Supports Linux and macOS. Install from source:
+Supports Linux and macOS. Install from crates.io:
 
 ```sh
-git clone https://github.com/yexiyue/waybill.git
-cd waybill
-cargo install --path crates/waybill-cli --locked
+cargo install waybill-cli --version 0.1.0 --locked
 wb --help
 ```
 

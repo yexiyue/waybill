@@ -14,7 +14,7 @@
 
 ## 当前仓库
 
-项目处于 **M4 OpenDAL 对象存储已接入，本地 S3 兼容服务器与真实 OSS 验收，未发布**。M1 已交付公开上传
+项目处于 **M4 OpenDAL 对象存储已接入，本地 S3 兼容服务器与真实 OSS 验收，0.1.0 已发布到 crates.io**。M1 已交付公开上传
 契约、service-fs 稳定源与 checkpoint、service-gdrive 上传与对账，`wb` CLI
 的 login / put / status 上传侧闭环已通过真机验收。M2 下载侧（核心下载契约
 与并行引擎、GDrive 范围读取、fs `.part` 暂存与发布、`wb get` / `wb list`、盘配置与多选文件选择器）

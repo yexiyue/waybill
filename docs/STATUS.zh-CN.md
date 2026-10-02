@@ -6,6 +6,11 @@
 
 ## 当前状态
 
+2026-10-02 已发布 [v0.1.0](https://github.com/yexiyue/waybill/releases/tag/v0.1.0)，
+六个公开 crate 的 0.1.0 均已在 crates.io 核验可见且未撤回。五个库按依赖顺序发布后，
+CLI 遇到新包限流；在服务端指定时间后，通过同一 tag 的单包工作流补发成功。
+Release 包含版本说明与完整首次发布 git log；后续发布和补发流程见[发布指南](RELEASING.zh-CN.md)。
+
 项目处于 **0.x 开发阶段，尚未发布稳定版本**。本地与 Google Drive、WebDAV、OpenDAL 对象存储之间的上传、
 下载和持久恢复已实现；CLI 提供登录、盘配置、目录浏览、多文件传输与交互选择。
 公开 API 仍可能调整；当前直接注入 service 端口，核心不提供自己的 Operator / registry；对象存储接受 OpenDAL Operator。

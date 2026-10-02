@@ -52,15 +52,15 @@ waybill 把一次文件传输建模为一张「运单」：开工前先落盘一
 
 ## 库接入
 
-项目处于 0.x，尚未发布到 crates.io，公开 API 可能调整；通过 git 依赖引入，
+0.1.0 已发布到 crates.io，项目处于 0.x，公开 API 可能调整；
 需要 **Rust 1.91+**（edition 2024）。当前 service 均为原生实现，宿主自带
 Tokio 运行时：
 
 ```toml
 [dependencies]
-waybill = { git = "https://github.com/yexiyue/waybill" }
-waybill-service-fs = { git = "https://github.com/yexiyue/waybill" }
-waybill-service-gdrive = { git = "https://github.com/yexiyue/waybill" }
+waybill = "0.1.0"
+waybill-service-fs = "0.1.0"
+waybill-service-gdrive = "0.1.0"
 # waybill-service-webdav / waybill-service-opendal 按需引入
 tokio = { version = "1", features = ["full"] }
 ```
@@ -247,12 +247,10 @@ let identity = source.identity().await?; // 大小、版本与 BLAKE3
 
 ### 安装
 
-支持 Linux 和 macOS。从源码安装：
+支持 Linux 和 macOS。从 crates.io 安装：
 
 ```sh
-git clone https://github.com/yexiyue/waybill.git
-cd waybill
-cargo install --path crates/waybill-cli --locked
+cargo install waybill-cli --version 0.1.0 --locked
 wb --help
 ```
 
