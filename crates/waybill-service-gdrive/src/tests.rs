@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -720,11 +720,11 @@ async fn invalid_range_returns_protocol_error_and_keeps_checkpoint() {
 #[derive(Clone)]
 struct FailingStore {
     inner: FileCheckpointStore,
-    fail_receipt: Arc<AtomicUsize>,
+    fail_receipt: Arc<AtomicBool>,
 }
 struct FailingLease {
     inner: Box<dyn CheckpointLease>,
-    fail_receipt: Arc<AtomicUsize>,
+    fail_receipt: Arc<AtomicBool>,
 }
 impl CheckpointStore for FailingStore {
     fn acquire<'a>(&'a self, operation: &'a str) -> BoxFuture<'a, Box<dyn CheckpointLease>> {
@@ -745,10 +745,7 @@ impl CheckpointLease for FailingLease {
             if checkpoint
                 .upload()
                 .is_some_and(|flow| flow.receipt.is_some())
-                && self
-                    .fail_receipt
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
+                && self.fail_receipt.swap(false, Ordering::SeqCst)
             {
                 return Err(Error::new(
                     ErrorKind::Checkpoint,
@@ -771,7 +768,7 @@ async fn remote_completion_survives_receipt_save_failure_and_instance_mismatch()
     let identity = source.identity().await.unwrap();
     let store = FailingStore {
         inner: FileCheckpointStore::new(dir.path().join("cp")),
-        fail_receipt: Arc::new(AtomicUsize::new(1)),
+        fail_receipt: Arc::new(AtomicBool::new(true)),
     };
     server.add(prepare());
     server.add(initialize(&server));
