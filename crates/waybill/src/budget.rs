@@ -51,12 +51,25 @@ impl ResourceBudget {
         self.concurrency
     }
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.concurrency).then_some(n + 1)
-            })
-            .map_err(|_| Error::new(ErrorKind::ResourceBusy, "transfer budget exhausted"))?;
-        Ok(Permit(self.clone()))
+        // CAS 保留 Rust 1.91 支持，避免新版对 fetch_update 的弃用诊断。
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.concurrency {
+                return Err(Error::new(
+                    ErrorKind::ResourceBusy,
+                    "transfer budget exhausted",
+                ));
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Permit(self.clone())),
+                Err(current) => active = current,
+            }
+        }
     }
 }
 pub(crate) struct Permit(Arc<ResourceBudget>);
