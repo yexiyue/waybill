@@ -2,13 +2,13 @@
 use super::{
     Event, Failure, Outcome, complete_queue, emit_progress, failure, operation_id, output_closed,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use waybill::{
     error::ErrorKind,
     source::Source,
     transfer::{ConflictPolicy, StopToken, TransferEngine},
-    upload::{UploadIntent, UploadOptions},
+    upload::{StreamUploadSink, UploadIntent, UploadOptions, UploadPolicy, UploadSink},
 };
 use waybill_service_fs::FileSource;
 /// 一个待投递文件：本地路径与解析后的远端目标。
@@ -18,9 +18,32 @@ pub(crate) struct UploadJob {
     pub target: String,
 }
 
+/// 宿主按公开能力选择上传端口，队列不包含 provider 分支。
+pub(crate) enum UploadPort {
+    Offset(Arc<dyn UploadSink>),
+    Stream(Arc<dyn StreamUploadSink>),
+}
+impl UploadPort {
+    pub(crate) fn open(service: &dyn waybill::service::Service) -> waybill::error::Result<Self> {
+        let caps = service.info().capabilities;
+        if caps.offset_upload {
+            Ok(Self::Offset(service.upload_sink()?))
+        } else {
+            Ok(Self::Stream(service.stream_upload_sink()?))
+        }
+    }
+    fn identity(&self) -> waybill::service::ServiceIdentity {
+        match self {
+            Self::Offset(sink) => sink.identity(),
+            Self::Stream(sink) => sink.identity(),
+        }
+    }
+}
+
 /// 编排资源由一个队列拥有，输出通过有界通道交付。
 pub(crate) struct UploadRunner {
-    pub sink: std::sync::Arc<dyn waybill::upload::UploadSink>,
+    pub sink: UploadPort,
+    pub policy: UploadPolicy,
     pub engine: TransferEngine,
     pub stop: StopToken,
     pub conflict: ConflictPolicy,
@@ -71,7 +94,7 @@ impl UploadRunner {
         job: &UploadJob,
         operation_override: Option<&str>,
     ) -> Result<(), Failure> {
-        let source = FileSource::open(&job.path).await.map_err(|e| failure(&e))?;
+        let source = Arc::new(FileSource::open(&job.path).await.map_err(|e| failure(&e))?);
         let identity = source.identity().await.map_err(|e| failure(&e))?;
         let operation = operation_override.map(str::to_string).unwrap_or_else(|| {
             derive_operation(&self.sink.identity(), &job.target, &identity.blake3)
@@ -86,37 +109,43 @@ impl UploadRunner {
             })
             .await
             .map_err(|_| output_closed())?;
-        let receipt = self
-            .engine
-            .upload(
-                &source,
-                self.sink.as_ref(),
-                UploadOptions {
-                    intent: UploadIntent {
-                        operation,
-                        target: job.target.clone(),
-                        conflict: self.conflict,
-                    },
-                    policy: Default::default(),
-                    stop: self.stop.clone(),
-                    progress: Some(&|p| {
-                        emit_progress(
-                            &self.events,
-                            &self.stop,
-                            Event::Progress {
-                                index,
-                                persisted: p.persisted,
-                                sent: p.sent,
-                                total: p.total,
-                                epoch: p.epoch,
-                                complete: p.complete,
-                            },
-                        );
-                    }),
+        let progress = |p: waybill::upload::UploadProgress| {
+            emit_progress(
+                &self.events,
+                &self.stop,
+                Event::Progress {
+                    index,
+                    persisted: p.persisted,
+                    sent: p.sent,
+                    total: p.total,
+                    epoch: p.epoch,
+                    complete: p.complete,
                 },
-            )
-            .await
-            .map_err(|e| failure(&e))?;
+            );
+        };
+        let options = UploadOptions {
+            intent: UploadIntent {
+                operation,
+                target: job.target.clone(),
+                conflict: self.conflict,
+            },
+            policy: self.policy,
+            stop: self.stop.clone(),
+            progress: Some(&progress),
+        };
+        let receipt = match &self.sink {
+            UploadPort::Offset(sink) => {
+                self.engine
+                    .upload(source.as_ref(), sink.as_ref(), options)
+                    .await
+            }
+            UploadPort::Stream(sink) => {
+                self.engine
+                    .upload_stream(source, sink.as_ref(), options)
+                    .await
+            }
+        }
+        .map_err(|e| failure(&e))?;
         self.events
             .send(Event::Completed { index, receipt })
             .await
@@ -275,7 +304,8 @@ mod tests {
     ) -> (super::Outcome, Vec<Event>) {
         let (events, mut receiver) = tokio::sync::mpsc::channel(64);
         let runner = UploadRunner {
-            sink,
+            sink: super::UploadPort::Offset(sink),
+            policy: Default::default(),
             engine: TransferEngine::new(FileCheckpointStore::new(dir.join("checkpoints"))),
             stop,
             conflict: ConflictPolicy::Reject,

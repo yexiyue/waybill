@@ -9,6 +9,20 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+mod stream;
+pub use stream::{StreamStatus, StreamUploadSink, UploadBody};
+
+/// 上传恢复语义；整文件写入不伪装成连续偏移会话。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadMode {
+    /// 服务端确认连续偏移。
+    #[default]
+    Offset,
+    /// 有界整文件流；未完成的请求只能显式从头重传。
+    Stream,
+}
+
 /// 消费者指定的通用上传意图，不包含设备或接收会话。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadIntent {
@@ -122,7 +136,7 @@ pub trait UploadSink: Send + Sync {
 /// 上传恢复策略。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UploadPolicy {
-    /// 允许过期后从头重传；默认 false，每次运行最多两次。
+    /// 允许过期或整文件写入中断后从头重传；默认 false；偏移会话每次最多重建两次，整文件每次最多发送一次。
     pub allow_restart: bool,
 }
 /// 不将发送、确认、持久化和完成混为一谈的进度。
@@ -205,83 +219,22 @@ impl TransferEngine {
         }
         let identity = source.identity().await?;
         identity.validate()?;
-        let mut flow = match lease.load().await? {
-            Some(saved) => {
-                if !Checkpoint::supported(saved.version) {
-                    return Err(Error::new(
-                        ErrorKind::IncompatibleVersion,
-                        "checkpoint version",
-                    ));
-                }
-                match saved.flow {
-                    Flow::Upload(flow) => {
-                        if flow.intent != intent || flow.service != service.clone() {
-                            return Err(Error::new(
-                                ErrorKind::IdentityMismatch,
-                                "checkpoint binding",
-                            ));
-                        }
-                        if flow.source != identity {
-                            return Err(Error::new(
-                                ErrorKind::SourceChanged,
-                                "source identity changed",
-                            ));
-                        }
-                        if flow.acknowledged > identity.size {
-                            return Err(Error::new(ErrorKind::Checkpoint, "invalid saved offset"));
-                        }
-                        flow
-                    }
-                    Flow::Download(_) => {
-                        return Err(Error::new(
-                            ErrorKind::IdentityMismatch,
-                            "checkpoint binding",
-                        ));
-                    }
-                }
-            }
-            None => {
-                let driver = sink.prepare(&intent, &identity).await?;
-                let flow = UploadFlow {
-                    intent,
-                    service: service.clone(),
-                    source: identity,
-                    acknowledged: 0,
-                    restarts: 0,
-                    driver,
-                    receipt: None,
-                };
-                lease.save(&flow.checkpoint()).await?;
-                flow
-            }
-        };
+        let mut flow = load_flow(
+            lease.as_ref(),
+            intent.clone(),
+            service,
+            identity.clone(),
+            UploadMode::Offset,
+            sink.prepare(&intent, &identity),
+        )
+        .await?;
         let mut status = sink.probe(&flow.intent, &flow.source, &flow.driver).await?;
         let mut restarts = 0;
         let mut sent = 0u64;
         loop {
             match status {
                 SessionStatus::Complete { state, receipt } => {
-                    if receipt.operation != flow.intent.operation
-                        || receipt.service != flow.service
-                        || receipt.target != flow.intent.target
-                        || receipt.size != flow.source.size
-                        || receipt.object.is_empty()
-                    {
-                        return Err(Error::new(
-                            ErrorKind::Protocol,
-                            "invalid completion receipt",
-                        ));
-                    }
-                    if source.identity().await? != flow.source {
-                        return Err(Error::new(
-                            ErrorKind::SourceChanged,
-                            "source changed during upload",
-                        ));
-                    }
-                    flow.driver = state;
-                    flow.acknowledged = flow.source.size;
-                    flow.receipt = Some(receipt.clone());
-                    lease.save(&flow.checkpoint()).await?;
+                    finish(source, lease.as_ref(), &mut flow, state, &receipt).await?;
                     report(&flow, sent, progress);
                     return Ok(receipt);
                 }
@@ -418,4 +371,90 @@ fn report(flow: &UploadFlow, sent: u64, progress: &(dyn Fn(UploadProgress) + Sen
         epoch: flow.restarts,
         complete: flow.receipt.is_some(),
     });
+}
+
+// 两种上传共享身份绑定与回执校验；协议状态机仍各自表达恢复语义。
+async fn load_flow(
+    lease: &dyn crate::checkpoint::CheckpointLease,
+    intent: UploadIntent,
+    service: ServiceIdentity,
+    source: SourceIdentity,
+    mode: UploadMode,
+    prepare: BoxFuture<'_, DriverState>,
+) -> Result<UploadFlow> {
+    if let Some(saved) = lease.load().await? {
+        if !Checkpoint::supported(saved.version) {
+            return Err(Error::new(
+                ErrorKind::IncompatibleVersion,
+                "checkpoint version",
+            ));
+        }
+        let Flow::Upload(flow) = saved.flow else {
+            return Err(Error::new(
+                ErrorKind::IdentityMismatch,
+                "checkpoint binding",
+            ));
+        };
+        if flow.intent != intent || flow.service != service || flow.mode != mode {
+            return Err(Error::new(
+                ErrorKind::IdentityMismatch,
+                "checkpoint binding",
+            ));
+        }
+        if flow.source != source {
+            return Err(Error::new(
+                ErrorKind::SourceChanged,
+                "source identity changed",
+            ));
+        }
+        if flow.acknowledged > source.size
+            || (mode == UploadMode::Stream
+                && flow.acknowledged != 0
+                && flow.acknowledged != source.size)
+        {
+            return Err(Error::new(ErrorKind::Checkpoint, "invalid saved offset"));
+        }
+        return Ok(flow);
+    }
+    let flow = UploadFlow {
+        mode,
+        intent,
+        service,
+        source,
+        acknowledged: 0,
+        restarts: 0,
+        driver: prepare.await?,
+        receipt: None,
+    };
+    lease.save(&flow.checkpoint()).await?;
+    Ok(flow)
+}
+async fn finish(
+    source: &dyn Source,
+    lease: &dyn crate::checkpoint::CheckpointLease,
+    flow: &mut UploadFlow,
+    state: DriverState,
+    receipt: &Receipt,
+) -> Result<()> {
+    if receipt.operation != flow.intent.operation
+        || receipt.service != flow.service
+        || receipt.target != flow.intent.target
+        || receipt.size != flow.source.size
+        || !crate::object::valid_reference(&receipt.object)
+    {
+        return Err(Error::new(
+            ErrorKind::Protocol,
+            "invalid completion receipt",
+        ));
+    }
+    if source.identity().await? != flow.source {
+        return Err(Error::new(
+            ErrorKind::SourceChanged,
+            "source changed during upload",
+        ));
+    }
+    flow.driver = state;
+    flow.acknowledged = flow.source.size;
+    flow.receipt = Some(receipt.clone());
+    lease.save(&flow.checkpoint()).await
 }

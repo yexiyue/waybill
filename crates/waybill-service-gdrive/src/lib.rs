@@ -79,6 +79,37 @@ impl Service for Gdrive {
             capabilities: self.capabilities(),
         }
     }
+    fn resolve<'a>(&'a self, path: &'a str) -> BoxFuture<'a, waybill::object::ObjectMetadata> {
+        Box::pin(async move {
+            match Gdrive::resolve(self, path).await? {
+                Resolved::Folder { id } => Ok(waybill::object::ObjectMetadata {
+                    reference: id,
+                    name: path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .into(),
+                    kind: waybill::object::ObjectKind::Directory,
+                    size: None,
+                    modified: None,
+                }),
+                Resolved::File(file) => Ok(file.into()),
+            }
+        })
+    }
+    fn list<'a>(
+        &'a self,
+        reference: &'a str,
+    ) -> BoxFuture<'a, Vec<waybill::object::ObjectMetadata>> {
+        Box::pin(async move {
+            Ok(Gdrive::list(self, reference)
+                .await?
+                .into_iter()
+                .map(Into::into)
+                .collect())
+        })
+    }
     fn upload_sink(&self) -> Result<Arc<dyn UploadSink>> {
         Ok(Arc::new(self.clone()))
     }

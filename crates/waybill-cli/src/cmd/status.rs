@@ -208,6 +208,7 @@ mod tests {
 
     fn upload_checkpoint(operation: &str, acknowledged: u64, with_receipt: bool) -> Checkpoint {
         UploadFlow {
+            mode: waybill::upload::UploadMode::Offset,
             intent: UploadIntent {
                 operation: operation.into(),
                 target: "backup/a.iso".into(),

@@ -10,7 +10,28 @@ pub async fn run(
     account_override: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let Provider::Gdrive = provider;
+    if let Provider::Webdav {
+        endpoint,
+        username,
+        auth,
+        password_stdin,
+    } = provider
+    {
+        if client.is_some() || no_browser {
+            return Err(CliError::Message(
+                "WebDAV 登录不使用 Google 客户端或浏览器参数".into(),
+            ));
+        }
+        return crate::webdav_host::login(
+            endpoint,
+            username,
+            auth,
+            password_stdin,
+            account_override,
+            json,
+        )
+        .await;
+    }
     if let Some(account) = &account_override
         && !uri::safe_account(account)
     {

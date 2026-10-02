@@ -24,8 +24,20 @@ Tokio 属于原生 service 与宿主；核心的 Send 约束尚不代表浏览�
 3. `initialize` 在已持久状态上初始化上传；重建由核心的显式策略触发。
 4. `write_chunk` 接收有界缓冲所有权，返回服务端确认偏移或完成证据，不按本机发送量确认。
 
-最小实现只支持 Source；核心当前上传引擎要求 durable offset upload，其他写入模式
-明确拒绝，后续按实际后端增加契约，不为 OSS / WebDAV 写默认成功的假实现。
+最小实现只支持 Source；连续偏移上传要求 durable offset upload，普通整文件
+写入使用独立的 `StreamUploadSink`，不把 PUT 伪装成 `write_chunk`。
+
+`Service::stream_upload_sink()` 打开整文件上传端口，消费者调用
+`engine.upload_stream(Arc<dyn Source>, sink, options)`。请求体按需读取，数据和
+验证读取共用预算；驱动不得无界预读或后台保留请求体。`prepare` 分配状态，
+`begin` 生成本次尝试，二者均不能修改远端；核心先保存状态，再调用 `write`。
+`probe` 返回 Ready / Staged / Complete，Staged 状态保存后才可调用 `publish`。
+中断默认保留记录，重传需要 `options.policy.allow_restart`；暂存已完整时只
+重试发布。公共 checkpoint 的 `mode` 绑定上传方式，不能切换端口恢复。
+
+`Service::resolve` / `list` 提供可选的目录访问，返回 `ObjectMetadata`。路径、
+对象引用与展示名称各有用途，不把展示名称当作恢复身份。服务端响应和项数
+须有上限；未实现的端口返回 Unsupported，不能默认成功。
 
 ## 下载源与本地目标
 
@@ -103,8 +115,13 @@ GDrive 上传回执声明 `Verification::Length`；下载校验服务端提供�
 显式重建递增 epoch；sent、acknowledged、persisted 与 complete 分开表达。
 
 文件校验缓冲及 Tokio 文件内部 IO 复制缓冲各限 256 KiB；元数据响应与 checkpoint 各限 1 MiB；Drive 列表最多 1000 项，
-目录深度最多 32，没有目录缓存。HTTP 单次超时 60 秒，安全请求最多三次重试，
-单次退避最多 30 秒。上传 PUT 网络结果未知时先 probe，避免透明重试错误推进状态。
+云端目录最多 1000 个子项，目录深度最多 32，没有目录缓存。
+GDrive HTTP 单次超时 60 秒，安全请求最多三次重试，单次退避最多 30 秒。
+WebDAV 使用 `WebdavConfig::new(endpoint, account)`；普通请求总时限默认 60 秒，
+整文件 PUT 总时限默认一小时，均覆盖响应正文读取。宿主可通过 `request_timeout` /
+`upload_timeout` 调整为非零且不超过 24 小时；连接建立另限 10 秒。
+期限不包含宿主凭证获取，也不代表整个传输只有一个总时限。
+上传 PUT 网络结果未知时先 probe，避免透明重试错误推进状态。
 
 核心错误使用 thiserror，保留稳定 ErrorKind 与受控静态上下文；必要的底层 source
 供诊断，但不得直接打印来源链。reqwest 错误可能带能力 URL，因此 GDrive 边界只

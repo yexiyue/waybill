@@ -14,13 +14,15 @@
 
 ## 当前仓库
 
-项目处于 **M2 GDrive 下载与本地发布已验收，未发布**。M1 已交付公开上传
+项目处于 **M3 WebDAV 已接入并完成本地服务器矩阵验收，未发布**。M1 已交付公开上传
 契约、service-fs 稳定源与 checkpoint、service-gdrive 上传与对账，`wb` CLI
 的 login / put / status 上传侧闭环已通过真机验收。M2 下载侧（核心下载契约
 与并行引擎、GDrive 范围读取、fs `.part` 暂存与发布、`wb get` / `wb list`、盘配置与多选文件选择器）
 已完成本地分层与真实 Drive 验收；具体能力与未覆盖边界均见
 [docs/VALIDATION.zh-CN.md](docs/VALIDATION.zh-CN.md)。Operator / registry
 等长期设计草图不是既有 API。
+WebDAV 已提供目录、条件范围读取、整文件流式上传与 MOVE 对账；普通 PUT
+中断需显式允许整文件重传。服务器范围见 [WebDAV 验收记录](docs/webdav-acceptance.zh-CN.md)。
 
 | 路径 | 用途 |
 |---|---|
@@ -28,6 +30,7 @@
 | `crates/waybill/` | 公开契约与上传、下载状态机 |
 | `crates/waybill-service-fs/` | 稳定本地源、持久 checkpoint 与下载本地目标 |
 | `crates/waybill-service-gdrive/` | 原生 GDrive 上传协议、对账与范围读取下载 |
+| `crates/waybill-service-webdav/` | WebDAV 访问、流式上传与条件发布对账 |
 | `crates/waybill-cli/` | `wb` 命令行宿主：OAuth、凭证、投递与取回、面板 |
 | `examples/consumer/` | 独立公开 API 接入示例 |
 | `docs/DESIGN.zh-CN.md` | 架构、恢复语义、扩展契约与路线图 |

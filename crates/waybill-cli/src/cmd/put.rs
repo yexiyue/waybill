@@ -1,16 +1,15 @@
 //! `wb put`：多文件顺序投递；重跑同一命令即续传或回执幂等跳过。
 use crate::{
     cli::PutArgs,
+    cloud_host,
     cmd::session,
     error::CliError,
-    gdrive_host,
     paths::Layout,
-    transfer::{UploadJob, UploadRunner},
+    transfer::{UploadJob, UploadPort, UploadRunner},
     uri,
 };
 use std::collections::HashSet;
 use waybill::{
-    service::Service,
     transfer::{StopToken, TransferEngine},
     upload::UploadIntent,
 };
@@ -23,6 +22,7 @@ pub async fn run(
     verbose: u8,
 ) -> Result<(), CliError> {
     let PutArgs {
+        allow_restart,
         sources,
         dest,
         operation,
@@ -71,10 +71,10 @@ pub async fn run(
         }
         jobs.push(UploadJob { path, name, target });
     }
-    let root = root.as_deref().unwrap_or("root");
+    let root = root.as_deref().unwrap_or(dest.provider.default_root());
     let layout = Layout::discover()?;
-    let drive = gdrive_host::build(&layout, &dest.account, root).await?;
-    let sink = drive.upload_sink()?;
+    let drive = cloud_host::build(&layout, dest.provider, &dest.account, root).await?;
+    let sink = UploadPort::open(drive.as_ref())?;
     let store = FileCheckpointStore::new(layout.checkpoints());
     let engine = TransferEngine::new(store);
     let stop = StopToken::default();
@@ -85,6 +85,7 @@ pub async fn run(
         .collect();
     let handle = tokio::spawn(
         UploadRunner {
+            policy: waybill::upload::UploadPolicy { allow_restart },
             sink,
             engine,
             stop: stop.clone(),
@@ -100,7 +101,8 @@ pub async fn run(
         stop,
         session::Settings {
             banner: format!(
-                "gdrive · {} · {}",
+                "{} · {} · {}",
+                dest.provider.name(),
                 dest.account,
                 if dest.directory {
                     format!("{}/", dest.target)
@@ -126,6 +128,7 @@ mod tests {
 
     fn args(sources: Vec<std::path::PathBuf>, dest: &str) -> PutArgs {
         PutArgs {
+            allow_restart: false,
             sources,
             dest: dest.into(),
             operation: None,

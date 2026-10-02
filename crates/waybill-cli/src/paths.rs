@@ -41,4 +41,8 @@ impl Layout {
     pub fn gdrive_account(&self, account: &str) -> PathBuf {
         self.state.join("credentials").join("gdrive").join(account)
     }
+    /// WebDAV 账户的私有连接设置与密码目录。
+    pub fn webdav_account(&self, account: &str) -> PathBuf {
+        self.state.join("credentials").join("webdav").join(account)
+    }
 }

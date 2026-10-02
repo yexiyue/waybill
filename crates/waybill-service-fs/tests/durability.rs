@@ -10,6 +10,7 @@ use waybill::{
 use waybill_service_fs::{FileCheckpointStore, FileSource, decode_checkpoint};
 fn record() -> Checkpoint {
     UploadFlow {
+        mode: waybill::upload::UploadMode::Offset,
         intent: UploadIntent {
             operation: "lock-test".into(),
             target: "file.bin".into(),

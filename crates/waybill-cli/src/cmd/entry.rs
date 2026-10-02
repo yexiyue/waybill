@@ -5,9 +5,9 @@ use super::{
 };
 use crate::{
     cli::{DriveCommand, GetInput, ListArgs, ListInput, PutArgs, PutInput},
+    cloud_host,
     drives::{self, Drive, Drives},
     error::CliError,
-    gdrive_host,
     paths::Layout,
     ui::picker::{self, Action, Row},
     uri::{self, DriveUri},
@@ -23,11 +23,16 @@ pub(super) async fn drive(
     match command {
         DriveCommand::Add {
             name,
+            provider,
             account,
             root,
             default,
         } => {
-            let drive = Drive { account, root };
+            let drive = Drive {
+                provider,
+                account,
+                root: root.unwrap_or_else(|| provider.default_root().into()),
+            };
             drives::validate(&name, &drive)?;
             config.drives.insert(name.clone(), drive);
             if default || config.default.is_none() {
@@ -40,14 +45,20 @@ pub(super) async fn drive(
             config.default = Some(name);
             config.save(&layout)?;
         }
-        DriveCommand::Root { name, id } => {
+        DriveCommand::Root { name, root } => {
             let mut drive = config.select(Some(&name))?;
-            drive.root = match id {
-                Some(id) => id,
+            drive.root = match root {
+                Some(root) => root,
                 None => {
                     picker::require_interactive(json, false)?;
-                    let service = gdrive_host::build(&layout, &drive.account, "root").await?;
-                    browse::cloud(ui, &service, "", CloudMode::Directory)
+                    let service = cloud_host::build(
+                        &layout,
+                        drive.provider,
+                        &drive.account,
+                        drive.provider.default_root(),
+                    )
+                    .await?;
+                    browse::cloud(ui, service.as_ref(), "", CloudMode::Directory)
                         .await?
                         .folder
                 }
@@ -73,12 +84,13 @@ pub(super) async fn drive(
     } else {
         for (name, drive) in config.drives {
             println!(
-                "{} {name} · {} · 根 {}",
+                "{} {name} · {} · {} · 根 {}",
                 if config.default.as_deref() == Some(&name) {
                     "*"
                 } else {
                     " "
                 },
+                drive.provider.name(),
                 drive.account,
                 drive.root
             );
@@ -98,10 +110,11 @@ async fn location(
             return Err(CliError::Message("完整 URI 与 --drive 不能同时指定".into()));
         }
         let parsed = uri::parse(raw)?;
-        let root = root.unwrap_or("root").to_string();
+        let root = root.unwrap_or(parsed.provider.default_root()).to_string();
         drives::validate(
             "selected",
             &Drive {
+                provider: parsed.provider,
                 account: parsed.account.clone(),
                 root: root.clone(),
             },
@@ -115,48 +128,19 @@ async fn location(
         Err(error) if name.is_some() || !interactive => return Err(error),
         Err(_) => {
             let candidates: Vec<(String, Drive)> = if config.drives.is_empty() {
-                let dir = layout
-                    .gdrive_account("placeholder")
-                    .parent()
-                    .ok_or_else(|| CliError::Message("账户目录无效".into()))?
-                    .to_path_buf();
-                let mut accounts = Vec::new();
-                match std::fs::read_dir(dir) {
-                    Ok(entries) => {
-                        for entry in entries {
-                            let entry = entry?;
-                            let Some(account) = entry.file_name().to_str().map(str::to_string)
-                            else {
-                                continue;
-                            };
-                            if entry.file_type()?.is_dir() && uri::safe_account(&account) {
-                                accounts.push((
-                                    account.clone(),
-                                    Drive {
-                                        account,
-                                        root: "root".into(),
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
-                accounts.sort_by(|a, b| a.0.cmp(&b.0));
-                accounts
+                cloud_host::accounts(&layout)?
             } else {
                 config.drives.into_iter().collect()
             };
             if candidates.is_empty() {
                 return Err(CliError::Message(
-                    "尚未登录；先运行 wb login gdrive --client <FILE>".into(),
+                    "尚未登录；先运行 wb login gdrive 或 wb login webdav".into(),
                 ));
             }
             let rows = candidates
                 .iter()
                 .map(|(name, drive)| Row {
-                    label: format!("{name} · {}", drive.account),
+                    label: format!("{name} · {} · {}", drive.provider.name(), drive.account),
                     selectable: false,
                     marked: false,
                 })
@@ -180,7 +164,8 @@ async fn location(
     drives::validate("selected", &selected)?;
     let raw = raw.unwrap_or("");
     let parsed = uri::parse(&format!(
-        "gdrive://{}/{}",
+        "{}://{}/{}",
+        selected.provider.name(),
         selected.account,
         raw.trim_start_matches('/')
     ))?;
@@ -215,8 +200,14 @@ pub(super) async fn list(
         )
         .await;
     }
-    let drive = gdrive_host::build(&Layout::discover()?, &location.account, &root).await?;
-    browse::cloud(ui, &drive, &location.target, CloudMode::View).await?;
+    let drive = cloud_host::build(
+        &Layout::discover()?,
+        location.provider,
+        &location.account,
+        &root,
+    )
+    .await?;
+    browse::cloud(ui, drive.as_ref(), &location.target, CloudMode::View).await?;
     Ok(())
 }
 pub(super) async fn put(
@@ -256,16 +247,23 @@ pub(super) async fn put(
         input.sources = browse::local(ui, false).await?;
     }
     if input.dest.is_none() {
-        let drive = gdrive_host::build(&Layout::discover()?, &location.account, &root).await?;
-        let selected = browse::cloud(ui, &drive, "", CloudMode::Directory).await?;
+        let drive = cloud_host::build(
+            &Layout::discover()?,
+            location.provider,
+            &location.account,
+            &root,
+        )
+        .await?;
+        let selected = browse::cloud(ui, drive.as_ref(), "", CloudMode::Directory).await?;
         // 人工选择的目标目录作为显式 service 根，支持上传到已有可访问目录。
-        root = selected.folder;
+        root = cloud_host::selected_root(location.provider, &root, &selected.folder);
         location.target.clear();
         location.directory = true;
     }
     put::run(
         ui,
         PutArgs {
+            allow_restart: input.allow_restart,
             sources: input.sources,
             dest: location.to_uri(),
             operation: input.transfer.operation,
@@ -310,7 +308,7 @@ pub(super) async fn get(
         return get::run(
             ui,
             crate::cli::GetArgs {
-                source: format!("gdrive://{}/{}", location.account, location.target),
+                source: location.to_uri(),
                 dest,
                 operation: input.transfer.operation,
                 conflict: input.transfer.conflict,
@@ -325,9 +323,24 @@ pub(super) async fn get(
     if input.transfer.operation.is_some() {
         return Err(CliError::Message("交互多选下载不能指定 --operation".into()));
     }
-    let drive = gdrive_host::build(&Layout::discover()?, &location.account, &root).await?;
-    let files = browse::cloud(ui, &drive, &location.target, CloudMode::Files)
+    let drive = cloud_host::build(
+        &Layout::discover()?,
+        location.provider,
+        &location.account,
+        &root,
+    )
+    .await?;
+    let files = browse::cloud(ui, drive.as_ref(), &location.target, CloudMode::Files)
         .await?
         .files;
-    get::run_files(ui, &drive, files, dest, input.transfer, json, verbose).await
+    get::run_files(
+        ui,
+        drive.as_ref(),
+        files,
+        dest,
+        input.transfer,
+        json,
+        verbose,
+    )
+    .await
 }

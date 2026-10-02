@@ -26,7 +26,7 @@ pub enum Verification {
     Unverified,
     /// 仅长度一致。
     Length,
-    /// 与服务端预期摘要一致。
+    /// 与预期摘要一致；证据来自服务端摘要或对远端内容的独立读取校验。
     Digest {
         /// 摘要算法。
         algorithm: DigestAlgorithm,

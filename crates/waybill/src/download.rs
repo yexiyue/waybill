@@ -39,7 +39,7 @@ impl RemoteIdentity {
         };
         if !bounded(&self.service.instance)
             || self.service.instance.chars().any(char::is_control)
-            || !bounded(&self.reference)
+            || !crate::object::valid_reference(&self.reference)
             || !bounded(&self.revision)
         {
             return Err(Error::new(

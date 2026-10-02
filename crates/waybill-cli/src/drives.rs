@@ -6,8 +6,32 @@ use std::{
     io::{Read, Write},
 };
 
+/// 宿主支持的 service 工厂；核心 service 标识仍是开放命名空间。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Gdrive,
+    Webdav,
+}
+impl ProviderKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gdrive => "gdrive",
+            Self::Webdav => "webdav",
+        }
+    }
+    pub fn default_root(self) -> &'static str {
+        match self {
+            Self::Gdrive => "root",
+            Self::Webdav => "/",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Drive {
+    pub provider: ProviderKind,
     pub account: String,
     pub root: String,
 }
@@ -74,16 +98,24 @@ impl Drives {
     }
 }
 pub fn validate(name: &str, drive: &Drive) -> Result<(), CliError> {
-    if !uri::safe_account(name)
-        || !uri::safe_account(&drive.account)
-        || drive.root.is_empty()
-        || drive.root.len() > 256
-        || !drive
-            .root
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    {
-        return Err(CliError::Message("盘名称、账户或根目录 ID 无效".into()));
+    let root_valid = match drive.provider {
+        ProviderKind::Gdrive => {
+            !drive.root.is_empty()
+                && drive.root.len() <= 256
+                && drive
+                    .root
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        }
+        ProviderKind::Webdav => {
+            drive.root == "/"
+                || waybill::object::valid_object_path(
+                    drive.root.strip_suffix('/').unwrap_or(&drive.root),
+                )
+        }
+    };
+    if !uri::safe_account(name) || !uri::safe_account(&drive.account) || !root_valid {
+        return Err(CliError::Message("盘名称、账户或根目录引用无效".into()));
     }
     Ok(())
 }
@@ -99,6 +131,7 @@ mod tests {
         config.drives.insert(
             "personal".into(),
             Drive {
+                provider: ProviderKind::Gdrive,
                 account: "a@example.com".into(),
                 root: "folder-a".into(),
             },
@@ -106,6 +139,7 @@ mod tests {
         config.drives.insert(
             "work".into(),
             Drive {
+                provider: ProviderKind::Gdrive,
                 account: "b@example.com".into(),
                 root: "folder-b".into(),
             },
@@ -136,6 +170,7 @@ mod tests {
             validate(
                 "../bad",
                 &Drive {
+                    provider: ProviderKind::Gdrive,
                     account: "a".into(),
                     root: "root".into()
                 }

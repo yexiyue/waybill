@@ -18,15 +18,15 @@
 
 waybill saves durable progress and completion receipts for uploads and downloads.
 After an interruption, rerun the same command to validate the source and saved
-state, then continue the transfer or reuse the completed result.
+state, then resume according to the backend policy or reuse the completed result.
 
-Use `wb` to manage Google Drive files, or embed transfers in an application through
+Use `wb` to manage Google Drive and WebDAV files, or embed transfers through
 the public Rust interfaces. The name comes from the document that travels with a
 shipment; [Bill](docs/BRAND.zh-CN.md) is our courier goose.
 
 ## Features
 
-- **Two-way transfers**: Google Drive uploads, downloads, and directory browsing.
+- **Two-way transfers**: Google Drive and WebDAV uploads, downloads, and directory browsing.
 - **Durable recovery**: checkpoints reconcile source versions, remote sessions, or local staging data before resuming.
 - **Interactive selection**: named drives, default roots, local and cloud file selection, and a fullscreen transfer dashboard.
 - **Scripting**: complete arguments run directly, with line-delimited JSON events and plain progress output.
@@ -82,11 +82,32 @@ Authorization uses `drive.file` to create and modify app-owned files and
 `drive.readonly` to read Drive. Credentials stay in a private local directory;
 upload destinations must still satisfy Google Drive's app access permissions.
 
+### WebDAV
+
+Configure an endpoint and username. Enter the password interactively, or use
+`--password-stdin` to read it from standard input.
+
+```sh
+wb login --account nas webdav --endpoint https://dav.example.com/files/ --username alice
+wb drive add nas --provider webdav --account nas
+wb --drive nas list
+wb --drive nas put ./a.zip --to backup/
+wb --drive nas get backup/a.zip ./a.zip
+```
+
+Use `--auth digest` for Digest or `--auth anonymous` for anonymous access. The
+endpoint includes the server root; a drive's `--root` is a relative directory below
+it. `wb drive root nas` selects it interactively. Backends share the same pickers
+and dashboard. Standard WebDAV PUT cannot resume at an offset: interrupted requests
+require `--allow-restart` to retransmit the whole file. Verified staging can retry
+publication alone. See the [WebDAV validation notes](docs/webdav-acceptance.zh-CN.md)
+for server requirements and the tested matrix.
+
 ## Commands and interaction
 
 | Command | Purpose |
 |---|---|
-| `wb login gdrive` | Sign in to Google Drive |
+| `wb login gdrive / webdav` | Sign in to Google Drive or WebDAV |
 | `wb drive add / list / use / root / remove` | Manage named drives, the default drive, and roots |
 | `wb list [PATH]` | List a directory, or browse interactively without a path |
 | `wb put [SRC…] --to PATH` | Upload files; select missing sources or destinations interactively |
@@ -119,7 +140,8 @@ wb --json put ./a.zip --to backup/
 wb get backup/a.zip ./a.zip --no-tui
 ```
 
-`--drive NAME` selects a drive for one command; `--root ID` overrides its root.
+`--drive NAME` selects a drive; `--root ROOT` overrides its root
+(a GDrive object ID or relative WebDAV directory).
 `wb drive use NAME` changes the default. `wb drive remove NAME` keeps credentials
 and recovery records.
 
@@ -127,9 +149,11 @@ An explicit account and full URI also work:
 
 ```sh
 wb get 'gdrive://account@example.com/backup/a.zip' ./a.zip
+wb get 'webdav://nas/backup/a.zip' ./a.zip
 ```
 
-Full URIs start at the Google root unless overridden with `--root`, and cannot be
+Full URIs start at the account root (Google root or WebDAV endpoint) unless
+overridden with `--root`, and cannot be
 combined with `--drive`. JSON output, `--no-tui`, and non-terminal sessions never
 open a picker; missing required arguments produce an error. See
 `wb <command> --help` for all options.
@@ -150,6 +174,7 @@ to keep another copy when a name conflicts.
 | [`waybill`](crates/waybill/) | Upload and download contracts, transfer engines, capabilities, and checkpoints |
 | [`waybill-service-fs`](crates/waybill-service-fs/) | Stable local sources, file checkpoints, download staging, and publication |
 | [`waybill-service-gdrive`](crates/waybill-service-gdrive/) | Google Drive protocol, upload reconciliation, ranged reads, and directory access |
+| [`waybill-service-webdav`](crates/waybill-service-webdav/) | Directory access, ranged reads, whole-file streams, content reconciliation, and conditional MOVE |
 | [`waybill-cli`](crates/waybill-cli/) | `wb`: authorization, drive configuration, interaction, and transfer orchestration |
 
 ```rust
@@ -163,6 +188,8 @@ The core is independent of backends and executors. Hosts own authorization and
 credential refresh; services obtain valid credentials at request boundaries.
 External services use the same public interfaces as the services in this workspace,
 implementing uploads, downloads, and recovery according to their capabilities.
+Use `engine.upload` for offset uploads or `engine.upload_stream` for whole-file
+streams with an `Arc<dyn Source>`. Both share storage, budgets, and receipt handling.
 
 Start with the [independent consumer example](examples/consumer/), or read the
 [service guide](docs/SERVICE.zh-CN.md) and [design document](docs/DESIGN.zh-CN.md).

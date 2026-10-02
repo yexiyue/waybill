@@ -46,6 +46,21 @@ impl RemoteFile {
         }
     }
 }
+impl From<RemoteFile> for waybill::object::ObjectMetadata {
+    fn from(file: RemoteFile) -> Self {
+        Self {
+            reference: file.id,
+            name: file.name,
+            size: file.size,
+            modified: file.modified_time,
+            kind: if file.folder {
+                waybill::object::ObjectKind::Directory
+            } else {
+                waybill::object::ObjectKind::File
+            },
+        }
+    }
+}
 /// 路径解析结果：文件交给下载源，文件夹供列表。
 #[derive(Debug, Clone)]
 pub enum Resolved {

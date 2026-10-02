@@ -57,6 +57,9 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct PutInput {
+    /// 允许过期会话或中断的 WebDAV PUT 从头重传整文件。
+    #[arg(long)]
+    pub allow_restart: bool,
     /// 本地文件；省略时多选。末尾完整 URI 仍可用作目标。
     #[arg(value_name = "SRC")]
     pub sources: Vec<PathBuf>,
@@ -82,7 +85,8 @@ pub struct GetInput {
 pub struct ListInput {
     /// 默认盘下的目录路径或完整 URI；省略时浏览云盘。
     pub path: Option<String>,
-    #[arg(long, value_name = "ID")]
+    /// 临时根目录：GDrive 对象 ID 或 WebDAV 相对目录路径。
+    #[arg(long, value_name = "ROOT")]
     pub root: Option<String>,
     /// 禁用交互及全屏传输面板。
     #[arg(long)]
@@ -96,8 +100,8 @@ pub struct TransferArgs {
     /// 同名目标的处理策略。
     #[arg(long, value_enum, default_value_t = Conflict::Reject)]
     pub conflict: Conflict,
-    /// 临时覆盖盘配置中的根目录对象 ID。
-    #[arg(long, value_name = "ID")]
+    /// 临时根目录：GDrive 对象 ID 或 WebDAV 相对目录路径。
+    #[arg(long, value_name = "ROOT")]
     pub root: Option<String>,
     /// 禁用交互及全屏传输面板。
     #[arg(long)]
@@ -108,17 +112,20 @@ pub enum DriveCommand {
     /// 添加或更新盘；第一个盘自动成为默认盘。
     Add {
         name: String,
+        /// 使用的云服务。
+        #[arg(long, value_enum, default_value_t = crate::drives::ProviderKind::Gdrive)]
+        provider: crate::drives::ProviderKind,
         #[arg(long)]
         account: String,
-        #[arg(long, default_value = "root")]
-        root: String,
+        #[arg(long)]
+        root: Option<String>,
         #[arg(long)]
         default: bool,
     },
     /// 设置默认盘。
     Use { name: String },
-    /// 设置默认根目录；省略 ID 时进入云端目录选择器。
-    Root { name: String, id: Option<String> },
+    /// 设置默认根目录；省略引用时进入云端目录选择器。
+    Root { name: String, root: Option<String> },
     /// 删除盘配置，保留登录凭证与恢复记录。
     Remove { name: String },
     /// 显示已配置的盘。
@@ -127,6 +134,8 @@ pub enum DriveCommand {
 
 /// 文件投递参数；由 clap 校验后交给命令编排。
 pub struct PutArgs {
+    /// 显式允许整文件重传。
+    pub allow_restart: bool,
     /// 本地源文件；允许多个。
     pub sources: Vec<PathBuf>,
     /// 目标 URI，如 gdrive://account@example.com/backup/
@@ -135,7 +144,7 @@ pub struct PutArgs {
     pub operation: Option<String>,
     /// 同名目标冲突策略。
     pub conflict: Conflict,
-    /// Drive 根目录对象 ID；缺省为 root。
+    /// 根目录：GDrive 缺省为 root，WebDAV 缺省为 /。
     pub root: Option<String>,
     /// 禁用全屏面板，使用行式输出（非终端自动生效）。
     pub no_tui: bool,
@@ -146,6 +155,28 @@ pub struct PutArgs {
 pub enum Provider {
     /// Google Drive（读取云盘文件，创建和修改本应用文件）。
     Gdrive,
+    /// WebDAV：使用 Basic / Digest 或匿名认证。
+    Webdav {
+        /// 服务端根目录 URL，不包含密码。
+        #[arg(long)]
+        endpoint: String,
+        /// 实际用户名；匿名认证可省略。
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long, value_enum, default_value_t = WebdavAuth::Basic)]
+        auth: WebdavAuth,
+        /// 从 stdin 读取密码；省略时在终端隐藏输入。
+        #[arg(long)]
+        password_stdin: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebdavAuth {
+    Basic,
+    Digest,
+    Anonymous,
 }
 
 /// 文件取回参数；源为云盘路径，目标为本地文件或目录。
@@ -158,7 +189,7 @@ pub struct GetArgs {
     pub operation: Option<String>,
     /// 同名本地目标冲突策略。
     pub conflict: Conflict,
-    /// Drive 根目录对象 ID；缺省为 root。
+    /// 根目录：GDrive 缺省为 root，WebDAV 缺省为 /。
     pub root: Option<String>,
     /// 禁用全屏面板，使用行式输出（非终端自动生效）。
     pub no_tui: bool,
@@ -168,7 +199,7 @@ pub struct GetArgs {
 pub struct ListArgs {
     /// 目录 URI，如 gdrive://account@example.com/backup/；根目录可省略路径。
     pub uri: String,
-    /// Drive 根目录对象 ID；缺省为 root。
+    /// 根目录：GDrive 缺省为 root，WebDAV 缺省为 /。
     pub root: Option<String>,
 }
 

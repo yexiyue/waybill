@@ -1,14 +1,15 @@
 //! `wb get`：从云盘取回单个文件；重跑同一命令即续传或回执幂等跳过。
 use crate::{
     cli::GetArgs,
+    cloud_host,
     cmd::session,
     error::CliError,
-    gdrive_host,
     paths::Layout,
     transfer::{DownloadJob, DownloadRunner},
     uri,
 };
 use std::path::{Path, PathBuf};
+use waybill::object::ObjectMetadata;
 use waybill::{
     download::DownloadIntent,
     error::{Error, ErrorKind},
@@ -16,7 +17,6 @@ use waybill::{
     transfer::TransferEngine,
 };
 use waybill_service_fs::{FileCheckpointStore, FsService};
-use waybill_service_gdrive::{Gdrive, RemoteFile, Resolved};
 
 /// CLI 本地目标的稳定实例命名空间；重跑必须命中同一实例。
 const LOCAL_INSTANCE: &str = "wb-local-v1";
@@ -55,25 +55,22 @@ pub async fn run(
     }
     .validate()?;
     let layout = Layout::discover()?;
-    let root = root.as_deref().unwrap_or("root");
-    let drive = gdrive_host::build(&layout, &source.account, root).await?;
+    let root = root.as_deref().unwrap_or(source.provider.default_root());
+    let drive = cloud_host::build(&layout, source.provider, &source.account, root).await?;
     // 解析云盘路径；目录、同名多义与缺失都在下载前拒绝。
     let resolved = drive
         .resolve(&source.target)
         .await
         .map_err(CliError::from)?;
-    let file = match resolved {
-        Resolved::File(file) => file,
-        Resolved::Folder { .. } => {
-            return Err(CliError::Message(format!(
-                "云端路径 {} 是目录；wb list 可浏览内容",
-                source.target
-            )));
-        }
-    };
+    if resolved.is_directory() {
+        return Err(CliError::Message(
+            "云端路径是目录；使用 wb list 浏览".into(),
+        ));
+    }
+    let file = resolved;
     run_files(
         ui,
-        &drive,
+        drive.as_ref(),
         vec![file],
         dest,
         crate::cli::TransferArgs {
@@ -90,8 +87,8 @@ pub async fn run(
 
 pub(super) async fn run_files(
     ui: &mut crate::ui::Session,
-    drive: &Gdrive,
-    files: Vec<RemoteFile>,
+    drive: &dyn Service,
+    files: Vec<ObjectMetadata>,
     dest: PathBuf,
     options: crate::cli::TransferArgs,
     json: bool,
@@ -131,7 +128,7 @@ pub(super) async fn run_files(
             )));
         }
         jobs.push(DownloadJob {
-            source: drive.download_source(&file.id).await?,
+            source: drive.download_source(&file.reference).await?,
             name: file.name,
             target,
         });

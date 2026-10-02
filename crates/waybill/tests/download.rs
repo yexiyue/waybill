@@ -950,6 +950,7 @@ async fn upload_records_cannot_drive_a_download_operation() {
     let target = FakeTarget::new(&events);
     let store = SharedStore::new(&events);
     let upload = waybill::checkpoint::UploadFlow {
+        mode: waybill::upload::UploadMode::Offset,
         intent: waybill::upload::UploadIntent {
             operation: "op-1".into(),
             target: "a.bin".into(),
@@ -989,6 +990,7 @@ async fn upload_records_cannot_drive_a_download_operation() {
 #[test]
 fn v2_records_roundtrip_and_download_records_stay_distinct() {
     let flow = waybill::checkpoint::UploadFlow {
+        mode: waybill::upload::UploadMode::Offset,
         intent: waybill::upload::UploadIntent {
             operation: "legacy".into(),
             target: "a.bin".into(),

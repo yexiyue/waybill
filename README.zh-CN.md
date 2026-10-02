@@ -17,14 +17,14 @@
 </p>
 
 waybill 为上传和下载保存持久进度与完成回执。传输中断后，重新运行同一命令，
-即可核验源文件和已保存状态，继续传输或复用完成结果。
+即可核验源文件和已保存状态，按后端策略恢复或复用完成结果。
 
-你可以用 `wb` 管理 Google Drive 文件，也可以通过 Rust 公开接口把传输能力嵌入应用。
+你可以用 `wb` 管理 Google Drive 与 WebDAV 文件，也可以通过 Rust 公开接口把传输能力嵌入应用。
 项目名称来自随货同行的「运单」；[Bill · 雁哥](docs/BRAND.zh-CN.md) 是我们的邮差鸿雁。
 
 ## 功能
 
-- **双向传输**：Google Drive 上传、下载与目录浏览。
+- **双向传输**：Google Drive 与 WebDAV 上传、下载及目录浏览。
 - **持久恢复**：保存 checkpoint，恢复时对账源版本、远端会话或本地暂存数据。
 - **交互选择**：命名盘、默认根目录、本地与云端文件多选，以及全屏传输面板。
 - **脚本集成**：完整参数直接执行，支持逐行 JSON 事件与行式进度。
@@ -77,11 +77,29 @@ wb status                     # 查看在途记录与完成回执
 授权使用 `drive.file` 创建和修改本应用文件，使用 `drive.readonly` 读取云盘。
 凭证保存在本机私有目录；上传目标仍须满足 Google Drive 的应用访问权限。
 
+### WebDAV
+
+配置端点和用户名；密码交互输入，也可用 `--password-stdin` 从标准输入读取。
+
+```sh
+wb login --account nas webdav --endpoint https://dav.example.com/files/ --username alice
+wb drive add nas --provider webdav --account nas
+wb --drive nas list
+wb --drive nas put ./a.zip --to backup/
+wb --drive nas get backup/a.zip ./a.zip
+```
+
+`--auth digest` 使用 Digest，`--auth anonymous` 使用匿名访问。端点包含服务端
+根路径，盘的 `--root` 是此端点下的相对目录；`wb drive root nas` 可以交互选择。
+所有后端共用文件选择器和传输面板。普通 WebDAV PUT 不支持偏移续传：中断后
+必须用 `--allow-restart` 显式允许整文件重传；已校验暂存可只重试发布。
+服务端要求与兼容矩阵见 [WebDAV 验收记录](docs/webdav-acceptance.zh-CN.md)。
+
 ## 命令与交互
 
 | 命令 | 用途 |
 |---|---|
-| `wb login gdrive` | 登录 Google Drive |
+| `wb login gdrive / webdav` | 登录 Google Drive 或 WebDAV |
 | `wb drive add / list / use / root / remove` | 管理命名盘、默认盘与根目录 |
 | `wb list [PATH]` | 列出指定目录；省略路径时交互浏览 |
 | `wb put [SRC…] --to PATH` | 上传文件；缺少源或目标时交互选择 |
@@ -96,7 +114,7 @@ wb status                     # 查看在途记录与完成回执
 `wb --json status` 输出 JSON 数组。选择器与传输面板共用全屏会话，步骤切换不退出终端。
 
 传输时默认显示全屏面板；`--no-tui` 使用行式输出。首次 Ctrl-C 优雅停止，
-再次 Ctrl-C 立即中止。保留源文件、盘配置与本机记录，重跑同一命令即可恢复。
+再次 Ctrl-C 立即中止。保留源文件、盘配置与本机记录，按后端恢复策略重跑。
 
 ### 直接执行与脚本
 
@@ -112,16 +130,17 @@ wb --json put ./a.zip --to backup/
 wb get backup/a.zip ./a.zip --no-tui
 ```
 
-`--drive NAME` 临时切换盘，`--root ID` 临时覆盖根目录。
+`--drive NAME` 临时切换盘，`--root ROOT` 临时覆盖根目录（GDrive 对象 ID 或 WebDAV 相对目录）。
 `wb drive use NAME` 修改默认盘；`wb drive remove NAME` 保留登录凭证和恢复记录。
 
 也可以直接指定账户与完整 URI：
 
 ```sh
 wb get 'gdrive://account@example.com/backup/a.zip' ./a.zip
+wb get 'webdav://nas/backup/a.zip' ./a.zip
 ```
 
-完整 URI 从 Google 根目录开始（可用 `--root` 覆盖），不能与 `--drive` 同时使用。
+完整 URI 从账户根目录开始（GDrive 为 Google 根目录，WebDAV 为登录端点；可用 `--root` 覆盖），不能与 `--drive` 同时使用。
 `--json`、`--no-tui` 和非终端环境不会自动进入选择器，缺少必要参数会报错。
 具体选项见 `wb <命令> --help`。
 
@@ -139,6 +158,7 @@ Google 原生文档可浏览，但不支持导出下载；目录不做递归下�
 | [`waybill`](crates/waybill/) | 上传与下载契约、传输引擎、能力声明与 checkpoint |
 | [`waybill-service-fs`](crates/waybill-service-fs/) | 稳定本地源、文件 checkpoint、下载暂存与发布 |
 | [`waybill-service-gdrive`](crates/waybill-service-gdrive/) | Google Drive 协议、上传会话对账、范围读取与目录访问 |
+| [`waybill-service-webdav`](crates/waybill-service-webdav/) | 目录和范围读取、整文件流式上传、内容对账及条件 MOVE |
 | [`waybill-cli`](crates/waybill-cli/) | `wb`：授权、盘配置、交互与传输编排 |
 
 ```rust
@@ -150,6 +170,8 @@ let receipt = engine.upload(source.as_ref(), sink.as_ref(),
 
 核心不绑定具体后端或执行器。宿主负责授权与凭证刷新，service 在请求边界获取有效凭证。
 外部 service 与仓库内 service 使用相同公开接口，按实际能力实现上传、下载与恢复。
+偏移上传用 `engine.upload`，整文件上传用 `engine.upload_stream`（源为 `Arc<dyn Source>`）；
+两者共享存储、预算与回执生命周期。
 
 从[独立消费者示例](examples/consumer/)开始集成，或阅读
 [service 开发指南](docs/SERVICE.zh-CN.md)与[设计文档](docs/DESIGN.zh-CN.md)。

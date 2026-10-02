@@ -1,7 +1,6 @@
 //! `wb list`：列出云盘目录内容；纯查询，不产生本机记录。
-use crate::{cli::ListArgs, error::CliError, gdrive_host, paths::Layout, ui::human_bytes, uri};
+use crate::{cli::ListArgs, cloud_host, error::CliError, paths::Layout, ui::human_bytes, uri};
 use serde::Serialize;
-use waybill_service_gdrive::Resolved;
 
 /// 单条目录项；字段与 JSON 输出共用。
 #[derive(Serialize)]
@@ -24,22 +23,28 @@ pub async fn run(args: ListArgs, json: bool) -> Result<(), CliError> {
         ));
     }
     let layout = Layout::discover()?;
-    let root = root.as_deref().unwrap_or("root");
-    let drive = gdrive_host::build(&layout, &parsed.account, root).await?;
+    let root = root.as_deref().unwrap_or(parsed.provider.default_root());
+    let drive = cloud_host::build(&layout, parsed.provider, &parsed.account, root).await?;
     let path = format!("{}/", parsed.target);
-    let folder = match drive.resolve(&path).await? {
-        Resolved::Folder { id } => id,
-        Resolved::File(_) => return Err(CliError::Message("云端路径不是目录".into())),
-    };
-    let entries = drive.list(&folder).await.map_err(CliError::from)?;
+    let folder = drive.resolve(&path).await?;
+    if !folder.is_directory() {
+        return Err(CliError::Message("云端路径不是目录".into()));
+    }
+    let entries = drive
+        .list(&folder.reference)
+        .await
+        .map_err(CliError::from)?;
     let mut rows: Vec<EntryRow> = entries
         .into_iter()
-        .map(|file| EntryRow {
-            name: file.name,
-            id: file.id,
-            size: file.size,
-            folder: file.folder,
-            modified: file.modified_time,
+        .map(|file| {
+            let folder = file.is_directory();
+            EntryRow {
+                name: file.name,
+                id: file.reference,
+                size: file.size,
+                folder,
+                modified: file.modified,
+            }
         })
         .collect();
     rows.sort_by_cached_key(|row| (!row.folder, row.name.to_lowercase(), row.id.clone()));

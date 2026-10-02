@@ -3,8 +3,9 @@ use crate::{
     BoxFuture,
     download::{DownloadSource, DownloadTarget},
     error::{Error, ErrorKind, Result},
+    object::ObjectMetadata,
     source::Source,
-    upload::UploadSink,
+    upload::{StreamUploadSink, UploadSink},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -80,7 +81,9 @@ pub struct Capabilities {
     pub range_source: bool,
     /// 支持连续偏移上传。
     pub offset_upload: bool,
-    /// 支持服务端会话对账与跨进程恢复。
+    /// 支持有界整文件流式上传；不表示支持按偏移续传。
+    pub stream_upload: bool,
+    /// 支持服务端结果对账与跨进程恢复；不等同于偏移续传。
     pub durable_upload: bool,
     /// 云端源支持精确范围读取。
     pub range_download: bool,
@@ -101,6 +104,25 @@ pub struct ServiceInfo {
 pub trait Service: Send + Sync {
     /// 返回实例能力。
     fn info(&self) -> ServiceInfo;
+    /// 解析配置根下的相对路径；根目录为 `/`，返回后端稳定对象引用。
+    /// 路径与对象引用不同（例如 Drive 文件 ID），语法由 service 校验。
+    fn resolve<'a>(&'a self, _path: &'a str) -> BoxFuture<'a, ObjectMetadata> {
+        Box::pin(async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "path resolution unavailable",
+            ))
+        })
+    }
+    /// 列举目录引用的直接子项；不递归，service 必须限制结果和响应大小。
+    fn list<'a>(&'a self, _reference: &'a str) -> BoxFuture<'a, Vec<ObjectMetadata>> {
+        Box::pin(async {
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "directory listing unavailable",
+            ))
+        })
+    }
     /// 以 service 自己解释的对象引用打开源。
     fn source<'a>(&'a self, _reference: &'a str) -> BoxFuture<'a, Arc<dyn Source>> {
         Box::pin(async { Err(Error::new(ErrorKind::Unsupported, "source unavailable")) })
@@ -108,6 +130,13 @@ pub trait Service: Send + Sync {
     /// 获取上传契约；最小只读 service 无需实现。
     fn upload_sink(&self) -> Result<Arc<dyn UploadSink>> {
         Err(Error::new(ErrorKind::Unsupported, "upload unavailable"))
+    }
+    /// 获取整文件上传契约；与连续偏移上传独立。
+    fn stream_upload_sink(&self) -> Result<Arc<dyn StreamUploadSink>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "stream upload unavailable",
+        ))
     }
     /// 以 service 自己解释的对象引用打开下载源。
     fn download_source<'a>(

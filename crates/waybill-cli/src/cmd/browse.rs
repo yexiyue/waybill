@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use std::{collections::BTreeMap, path::PathBuf};
-use waybill_service_gdrive::{Gdrive, RemoteFile, Resolved};
+use waybill::{object::ObjectMetadata, service::Service};
 
 const SELECTION_LIMIT: usize = 4096;
 const DIRECTORY_LIMIT: usize = 10000;
@@ -23,21 +23,25 @@ pub enum CloudMode {
 }
 pub struct CloudSelection {
     pub folder: String,
-    pub files: Vec<RemoteFile>,
+    pub files: Vec<ObjectMetadata>,
 }
 pub async fn cloud(
     ui: &mut crate::ui::Session,
-    drive: &Gdrive,
+    drive: &dyn Service,
     start: &str,
     mode: CloudMode,
 ) -> Result<CloudSelection, CliError> {
     let initial = format!("{}/", start.trim_end_matches('/'));
-    let Resolved::Folder { id } = drive.resolve(&initial).await? else {
+    let initial_folder = drive.resolve(&initial).await?;
+    if !initial_folder.is_directory() {
         return Err(CliError::Message("浏览起点必须是目录".into()));
-    };
-    let mut stack = vec![(id, start.trim_matches('/').to_string())];
+    }
+    let mut stack = vec![(
+        initial_folder.reference,
+        start.trim_matches('/').to_string(),
+    )];
     let mut selected = BTreeMap::new();
-    let mut listing: Option<(String, Vec<RemoteFile>)> = None;
+    let mut listing: Option<(String, Vec<ObjectMetadata>)> = None;
     loop {
         if selected.len() > SELECTION_LIMIT {
             return Err(CliError::Message("选择数量超过 4096 项上限".into()));
@@ -46,7 +50,11 @@ pub async fn cloud(
         if listing.as_ref().is_none_or(|(id, _)| id != &folder) {
             let mut files = drive.list(&folder).await?;
             files.sort_by_cached_key(|file| {
-                (!file.folder, file.name.to_lowercase(), file.id.clone())
+                (
+                    !file.is_directory(),
+                    file.name.to_lowercase(),
+                    file.reference.clone(),
+                )
             });
             listing = Some((folder.clone(), files));
         }
@@ -56,23 +64,23 @@ pub async fn cloud(
             .map(|file| Row {
                 label: format!(
                     "{} {}  {}",
-                    if file.folder { "▸" } else { " " },
+                    if file.is_directory() { "▸" } else { " " },
                     file.name,
                     file.size
                         .map(human_bytes)
-                        .unwrap_or_else(|| if file.folder {
+                        .unwrap_or_else(|| if file.is_directory() {
                             String::new()
                         } else {
                             "不可下载".into()
                         })
                 ),
-                selectable: mode == CloudMode::Files && !file.folder && file.size.is_some(),
-                marked: selected.contains_key(&file.id),
+                selectable: mode == CloudMode::Files && !file.is_directory() && file.size.is_some(),
+                marked: selected.contains_key(&file.reference),
             })
             .collect();
         let current_selected = files
             .iter()
-            .filter(|file| selected.contains_key(&file.id))
+            .filter(|file| selected.contains_key(&file.reference))
             .count();
         let title = if mode == CloudMode::Files {
             format!(
@@ -93,11 +101,11 @@ pub async fn cloud(
             },
         )
         .await?;
-        for (index, file) in files.iter().enumerate().filter(|(_, f)| !f.folder) {
+        for (index, file) in files.iter().enumerate().filter(|(_, f)| !f.is_directory()) {
             if picked.marked.contains(&index) {
-                selected.insert(file.id.clone(), file.clone());
+                selected.insert(file.reference.clone(), file.clone());
             } else {
-                selected.remove(&file.id);
+                selected.remove(&file.reference);
             }
         }
         match picked.action {
@@ -110,11 +118,11 @@ pub async fn cloud(
                         .rsplit_once('/')
                         .map(|(parent, _)| parent)
                         .unwrap_or("");
-                    let Resolved::Folder { id } = drive.resolve(&format!("{parent}/")).await?
-                    else {
+                    let parent_folder = drive.resolve(&format!("{parent}/")).await?;
+                    if !parent_folder.is_directory() {
                         return Err(CliError::Message("上级目录不可用".into()));
-                    };
-                    stack[0] = (id, parent.into());
+                    }
+                    stack[0] = (parent_folder.reference, parent.into());
                 }
             }
             Action::Confirm => {
@@ -131,7 +139,7 @@ pub async fn cloud(
             }
             Action::Open(index) => {
                 let file = &files[index];
-                if file.folder {
+                if file.is_directory() {
                     // 目录名仅用于显示；导航和上传选择始终绑定对象 ID。
                     let child = if path.is_empty() {
                         file.name.clone()
@@ -141,12 +149,12 @@ pub async fn cloud(
                     if stack.len() >= 32 {
                         return Err(CliError::Message("目录浏览超过 32 层上限".into()));
                     }
-                    stack.push((file.id.clone(), child));
+                    stack.push((file.reference.clone(), child));
                 } else if mode == CloudMode::Files
                     && file.size.is_some()
-                    && selected.remove(&file.id).is_none()
+                    && selected.remove(&file.reference).is_none()
                 {
-                    selected.insert(file.id.clone(), file.clone());
+                    selected.insert(file.reference.clone(), file.clone());
                 }
             }
         }

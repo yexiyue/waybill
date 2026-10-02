@@ -27,16 +27,18 @@ impl fmt::Debug for DriverState {
             .finish_non_exhaustive()
     }
 }
-/// 上传侧记录：绑定意图、目标实例、源身份与连续确认偏移。
+/// 上传侧记录：绑定意图、目标实例、源身份与实际确认进度。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadFlow {
+    /// 上传方式；禁止同一 checkpoint 切换偏移续传与整文件重传。
+    pub mode: crate::upload::UploadMode,
     /// 上传意图。
     pub intent: UploadIntent,
     /// 目标 service 实例。
     pub service: ServiceIdentity,
     /// 稳定源身份。
     pub source: SourceIdentity,
-    /// 最近一次服务端确认偏移；可以在对账时回退。
+    /// 最近一次确认进度；偏移上传可逐块确认，整文件上传仅为 0 或已校验暂存长度。
     pub acknowledged: u64,
     /// 已显式重建的次数，用于进度 epoch。
     pub restarts: u32,

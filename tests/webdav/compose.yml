@@ -1,0 +1,26 @@
+services:
+  apache:
+    image: httpd:2.4-bookworm@sha256:fbc12199ccad031d8047e9c789d65aceee2d14f99ba90664cd3a3996867a5582
+    ports:
+      - "127.0.0.1:18765:80"
+    volumes:
+      - ./httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /data/basic /data/digest
+        printf 'basic seed\n' > /data/basic/seed.txt
+        printf 'digest seed\n' > /data/digest/seed.txt
+        htpasswd -bc /tmp/basic.passwd tester fixture-password
+        htdigest -c /tmp/digest.passwd waybill-test tester <<PASS
+        fixture-password
+        fixture-password
+        PASS
+        chown -R www-data:www-data /data
+        exec httpd-foreground
+  wsgidav:
+    build:
+      context: .
+      dockerfile: Dockerfile.wsgidav
+    ports:
+      - "127.0.0.1:18766:8080"

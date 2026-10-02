@@ -1,6 +1,7 @@
 # 首期分层验收记录（2026-10-01）
 
-当前交付是未发布的 0.x GDrive 上传与下载原型。本记录保留 M1 首次上传验收
+当前交付是未发布的 0.x GDrive 与 WebDAV 双向传输原型。WebDAV 的服务器矩阵
+与复现见 [WebDAV 验收记录](webdav-acceptance.zh-CN.md)。本记录保留 M1 首次上传验收
 以及后续 M2 下载验收，旧节结论仅适用于当时基线；本轮审查结果见下文
 「M2 审查重构与真实下载验收」。SwarmDrop 正式回接不在本期。架构事实源为 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，接入方法见
 [SERVICE.zh-CN.md](SERVICE.zh-CN.md)。

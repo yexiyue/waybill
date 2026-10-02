@@ -5,11 +5,12 @@
 use waybill::error::{Error, ErrorKind, Result};
 use waybill::object::valid_object_path;
 
-const SCHEME: &str = "gdrive://";
+use crate::drives::ProviderKind;
 
 /// 解析后的云对象位置；上传、下载与列表共用。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveUri {
+    pub provider: ProviderKind,
     /// 账户标识，对应 `wb login` 保存的凭证目录。
     pub account: String,
     /// 相对根目录的目标或目录前缀；不以 `/` 开头，可为空（仅目录前缀）。
@@ -25,7 +26,12 @@ impl DriveUri {
         } else {
             ""
         };
-        format!("gdrive://{}/{}{suffix}", self.account, self.target)
+        format!(
+            "{}://{}/{}{suffix}",
+            self.provider.name(),
+            self.account,
+            self.target
+        )
     }
     /// 目录前缀拼接文件名，得到单个源的目标路径。
     pub fn join(&self, file_name: &str) -> Result<String> {
@@ -44,7 +50,12 @@ impl DriveUri {
 
 /// 解析并复用公开对象路径约束，在读取凭证之前拒绝无效目标。
 pub fn parse(uri: &str) -> Result<DriveUri> {
-    let rest = uri.strip_prefix(SCHEME).ok_or_else(invalid)?;
+    let (scheme, rest) = uri.split_once("://").ok_or_else(invalid)?;
+    let provider = match scheme {
+        "gdrive" => ProviderKind::Gdrive,
+        "webdav" => ProviderKind::Webdav,
+        _ => return Err(invalid()),
+    };
     let (account, path) = rest.split_once('/').ok_or_else(invalid)?;
     if !safe_account(account) || path.contains("//") {
         return Err(invalid());
@@ -59,6 +70,7 @@ pub fn parse(uri: &str) -> Result<DriveUri> {
         validate_target(&target)?;
     }
     Ok(DriveUri {
+        provider,
         account: account.to_string(),
         target,
         directory,
@@ -85,7 +97,7 @@ fn validate_target(target: &str) -> Result<()> {
 }
 
 fn invalid() -> Error {
-    Error::new(ErrorKind::InvalidInput, "invalid Drive URI")
+    Error::new(ErrorKind::InvalidInput, "invalid cloud URI")
 }
 
 #[cfg(test)]
@@ -131,7 +143,7 @@ mod tests {
     #[test]
     fn rejects_structural_errors() {
         for uri in [
-            "webdav://x/y",
+            "unknown://x/y",
             "gdrive://me@gmail.com",
             "gdrive://me@gmail.com/backup//a",
             "gdrive:///backup/",
@@ -146,6 +158,15 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    #[test]
+    fn webdav_paths_remain_literal_and_preserve_provider() {
+        let uri = "webdav://local/目录/100% 文件.txt";
+        let parsed = parse(uri).unwrap();
+        assert_eq!(parsed.provider, ProviderKind::Webdav);
+        assert_eq!(parsed.target, "目录/100% 文件.txt");
+        assert_eq!(parsed.to_uri(), uri);
     }
 
     #[test]
