@@ -10,11 +10,11 @@ repository = "https://github.com/yexiyue/waybill"
 rust-version = "1.91"
 
 [workspace.dependencies]
-waybill = { path = "crates/waybill" }
-waybill-service-fs = { path = "crates/waybill-service-fs" }
-waybill-service-gdrive = { path = "crates/waybill-service-gdrive" }
-waybill-service-webdav = { path = "crates/waybill-service-webdav" }
-waybill-service-opendal = { path = "crates/waybill-service-opendal" }
+waybill = { version = "0.1.0", path = "crates/waybill" }
+waybill-service-fs = { version = "0.1.0", path = "crates/waybill-service-fs" }
+waybill-service-gdrive = { version = "0.1.0", path = "crates/waybill-service-gdrive" }
+waybill-service-webdav = { version = "0.1.0", path = "crates/waybill-service-webdav" }
+waybill-service-opendal = { version = "0.1.0", path = "crates/waybill-service-opendal" }
 opendal = { version = "=0.59.3", default-features = false, features = ["auto-register-services", "http-transport-reqwest", "executors-tokio"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
 digest_auth = "0.3"
