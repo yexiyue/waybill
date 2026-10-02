@@ -48,7 +48,10 @@ Secret，页面显示到期日为 2026-12-31；令牌值未写入本机文件或
 Cargo 发布不具备跨 crate 原子性。如果中途失败，先确认 crates.io 上已经可见的版本，
 不要更换同一版本内容或 yank 成功包。失败于上传后等待索引时，上传可能已生效；
 等待索引可见，再用相同 tag 的 checkout 对尚未发布的包执行 `cargo publish -p <name>`，
-按依赖顺序补发。不要直接重复整套发布以掩盖“版本已存在”的错误。
+按依赖顺序补发。也可手动运行 Publish crates 工作流，输入原 release tag 和一个尚未发布的
+crate；它会重新校验该 tag、执行检查和单包 dry-run，再只发布选定包。凭证仍仅由 GitHub
+Secret 注入。若收到 crates.io 429 新包限流，等待错误中的允许重试时间后再补发。
+不要直接重复整套发布以掩盖“版本已存在”的错误。
 
 参考：[Cargo 发布命令](https://doc.rust-lang.org/cargo/commands/cargo-publish.html)、
 [Cargo 1.90 workspace 发布](https://doc.rust-lang.org/cargo/CHANGELOG.html#cargo-190-2025-09-18)、
