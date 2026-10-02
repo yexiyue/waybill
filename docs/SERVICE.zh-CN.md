@@ -11,7 +11,7 @@
 
 消费者一次构造 `TransferEngine::new(store)`，随后调用
 `engine.upload(source, sink, UploadOptions::new(operation, target))` 或
-`engine.download(source, target, DownloadOptions::new(operation, reference))`。
+`engine.download(source, target, DownloadOptions::new(operation, target_path))`。
 默认选项无需停止信号或进度回调；有需要时设置 `options.stop` / `options.progress`。
 存储支持具体实现和共享 `Arc<dyn CheckpointStore>`；`engine.clone()` 共享同一存储与预算。
 核心只依赖公开端口，service 异步方法返回 `BoxFuture`，引擎使用执行器无关的 async；没有 Tokio / reqwest / SwarmDrop 依赖。
