@@ -14,7 +14,8 @@ pub struct ResourceBudget {
 impl Default for ResourceBudget {
     fn default() -> Self {
         Self {
-            chunk_size: 8 * 1024 * 1024,
+            // 原生分片 writer 可能同时保留前一分片和正在填充的分片。
+            chunk_size: 16 * 1024 * 1024,
             active: AtomicUsize::new(0),
             concurrency: 2,
         }

@@ -103,14 +103,29 @@ prepare 时发现冲突后选择操作后缀，不覆盖。prepare 后新出现�
 GDrive 上传回执声明 `Verification::Length`；下载校验服务端提供的摘要后才能
 声明 `Verification::Digest`。共有证据类型属于 `content`，回执与停止信号属于 `transfer`。
 
+## OpenDAL 对象存储
+
+`waybill_service_opendal::ObjectStorage::new(operator, ObjectStorageConfig::new(namespace))`
+接受宿主配置的 OpenDAL Operator；namespace 必须绑定实际账户、端点和 bucket，
+不能只用会被重新绑定的本机别名。`at_root` 选择子前缀并隔离 checkpoint。
+凭证获取和刷新沿用 Operator provider / 宿主，不引入通用 OAuth 假设。
+
+默认只开放实际支持的访问能力。配置 `conditional_writes = true` 代表宿主确认当前
+服务端和 bucket 的条件创建有效，仍需通过 capability 检查；OSS / COS 尤其要核对版本控制。
+`operator()` 返回宿主原生 Operator，可调用 OpenDAL 其他操作；这些操作不获得 waybill
+的资源预算、checkpoint 或回执保证。库 feature、CLI 配置及边界见
+[对象存储接入](object-storage.zh-CN.md)，架构依据见 DESIGN §8.3。
+
 ## 资源与诊断
 
 一个 `TransferEngine` 的上传与下载自动共享预算；多个引擎通过
-`with_budget(Arc<ResourceBudget>)` 共享。默认 8 MiB 块、两份在途数据缓冲，
-上限 16 MiB；繁忙返回 ResourceBusy，由宿主决定等待策略。
+`with_budget(Arc<ResourceBudget>)` 共享。默认每操作 16 MiB、最多两个操作，
+数据预算上限 32 MiB；繁忙返回 ResourceBusy，由宿主决定等待策略。
 `Source` / `DownloadSource` 声明 `max_read_size`，`DownloadTarget` 声明
 `max_write_size`，`UploadSink` 声明 `UploadChunkLimits`。引擎选择预算和端口
 允许的块大小，并对上传非末块对齐；小于所需对齐的预算在远端准备前拒绝。
+`StreamUploadSink::write_buffer_size` 为协议缓存预留预算；
+`DownloadSource::read_buffer_multiplier` 计入协议缓冲到连续块的复制。
 每个 service 仍在 IO 边界检查范围与块形状。恢复对账可使确认进度回退，
 显式重建递增 epoch；sent、acknowledged、persisted 与 complete 分开表达。
 

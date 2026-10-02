@@ -13,18 +13,20 @@ pub enum ProviderKind {
     #[default]
     Gdrive,
     Webdav,
+    Object,
 }
 impl ProviderKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Gdrive => "gdrive",
             Self::Webdav => "webdav",
+            Self::Object => "object",
         }
     }
     pub fn default_root(self) -> &'static str {
         match self {
             Self::Gdrive => "root",
-            Self::Webdav => "/",
+            Self::Webdav | Self::Object => "/",
         }
     }
 }
@@ -107,7 +109,7 @@ pub fn validate(name: &str, drive: &Drive) -> Result<(), CliError> {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
         }
-        ProviderKind::Webdav => {
+        ProviderKind::Webdav | ProviderKind::Object => {
             drive.root == "/"
                 || waybill::object::valid_object_path(
                     drive.root.strip_suffix('/').unwrap_or(&drive.root),

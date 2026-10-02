@@ -10,6 +10,7 @@ mod drives;
 mod error;
 mod gdrive_host;
 mod oauth;
+mod object_host;
 mod paths;
 mod transfer;
 mod ui;

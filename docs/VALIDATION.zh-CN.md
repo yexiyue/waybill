@@ -1,6 +1,6 @@
 # 首期分层验收记录（2026-10-01）
 
-当前交付是未发布的 0.x GDrive 与 WebDAV 双向传输原型。WebDAV 的服务器矩阵
+当前交付是未发布的 0.x GDrive、WebDAV 与 OpenDAL 对象存储双向传输原型。WebDAV 的服务器矩阵
 与复现见 [WebDAV 验收记录](webdav-acceptance.zh-CN.md)。本记录保留 M1 首次上传验收
 以及后续 M2 下载验收，旧节结论仅适用于当时基线；本轮审查结果见下文
 「M2 审查重构与真实下载验收」。SwarmDrop 正式回接不在本期。架构事实源为 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)，接入方法见
@@ -311,3 +311,97 @@ JSON 数组。三种输出没有 ANSI 全屏控制符，旧格式记录诊断均
 
 workspace fmt、all-targets check、全特性 Clippy、测试与严格 rustdoc 全部通过。
 本轮为 126 项常规测试及 1 项文档编译测试；另 3 个辅助入口由父测试通过子进程执行。
+
+## M4 OpenDAL 对象存储验收（2026-10-02）
+
+基线 OpenDAL 0.59.3、Rust 下限 1.91；本轮实际环境 macOS / arm64、Rust 1.98.1、
+Docker 29.4。本次没有运行 Linux / 远端 CI，也未使用公有云 OSS / COS 等账户。
+
+| 层级 | 验证范围 |
+|---|---|
+| 工作区 | fmt、all-targets check、Clippy `-D warnings`、测试和 rustdoc `-D warnings` |
+| 可裁剪依赖 | `--no-default-features --lib` 构建；单独 `--features s3` 契约测试 |
+| 协议替身 | 12 项：根隔离、条件范围读取、源变化、忽略 Range、超大元数据、预算不足、checkpoint 绑定、未完成写入、发布响应丢失与回执复用、无 copy 条件 writer 发布、竞争写入不覆盖、空文件 / 后缀及原生入口边界 |
+| CLI 配置 | 原生 options、秘密脱敏、未知配置拒绝、凭证轮换与账户 / 端点隔离 |
+| 本地 S3 | RustFS Docker；17 MiB multipart 上传 / 下载 SHA-256、重复操作回执、目录 / 根、冲突 / 操作后缀、Unicode / 空文件 |
+| 真实进程中断 | Writing 状态落盘后 SIGKILL；默认 SessionExpired、显式 `--allow-restart` 整文件重传，128 MiB 下载校验一致 |
+
+本地脚本固定服务端镜像摘要，使用随机凭证、独立状态目录、动态 loopback 端口和唯一容器名，
+结束后清理测试容器、匿名卷与临时状态。复现步骤见[对象存储接入](object-storage.zh-CN.md)。
+
+这里验收的是 S3 兼容服务端。全部 11 种后端的注册检查和静态 capability 映射不构成
+对应公有云验收；条件写入、bucket 版本控制、STS 自动轮换和限流仍需服务端样本。
+上传 writer 的 multipart ID 不持久化，不能报告为跨进程分片续传。
+
+## 真实 OSS 验收（2026-10-02）
+
+本节补充上述本地 S3 结果，不扩大其他公有云结论。环境为 macOS / arm64、
+Rust 1.98.1、OpenDAL 0.59.3，真实 `oss` 后端及公网深圳 endpoint
+`https://oss-cn-shenzhen.aliyuncs.com`。专用 bucket 为
+`waybill-test-20261002-e00c45e2`：标准存储、LRS、私有、阻止公共访问开启、
+版本控制从未开启。凭证来自用户提供的 CSV，仅进程内读取及子进程环境传递；
+未修改 RAM、未上传 CSV、未保存密钥到连接配置或仓库。
+
+| 场景 | 实际结果 |
+|---|---|
+| 配置与浏览 | `object` 配置导入、盘配置、前缀目录、根目录切换、隐藏暂存通过 |
+| 17 MiB 上传 | multipart 暂存、无条件 copy 能力时完整读回与条件重上传发布、下载 SHA-256 一致 |
+| 幂等与冲突 | 重复同一操作复用回执；同名拒绝、操作后缀、Unicode 空文件往返通过 |
+| 发布竞争 | 使用公开 service API 校验暂存后，原生写入竞争对象；发布返回 Conflict，读回竞争字节保持不变 |
+| 128 MiB 中断 | Writing checkpoint 落盘后 SIGKILL；默认 SessionExpired，显式 `--allow-restart` 整文件重传，下载 SHA-256 一致 |
+| 清理 | 官方 ossutil 2.4.0 删除 7 个临时 / scratch 对象，取消 1 个未完成 multipart，复查未完成会话为 0 |
+
+首次 17 MiB 上传发现 OpenDAL 0.59.3 的 OSS multipart 初始化漏发用户元数据，
+导致归属探针正确拒绝无标记暂存。适配器增加签名前的 Content-Disposition 扩展参数
+作为 OSS 操作标记载体，未绕过归属或内容核验。新增无用户元数据的 OSS multipart
+协议回归测试；修复后重跑上述真实场景全部通过。fmt、workspace all-targets check、
+Clippy `-D warnings`、workspace 测试与 rustdoc `-D warnings` 均通过；
+真实竞争测试为显式运行的 ignored 测试，不属于无凭证工作区测试。
+
+成功样本和 bucket 按用户要求保留：
+
+| 对象 | 字节数 |
+|---|---:|
+| `samples/source.bin` | 17825792 |
+| `samples/interrupted.bin` | 134217728 |
+| `samples/source-08cc4a807e97.bin` | 17 |
+| `samples/空 文件.txt` | 0 |
+
+17 MiB 源与下载 SHA-256 为
+`ec50baf7fce21cbdb746f461b49328154ecce497b9fb1f5675ee13704c605bc4`；
+128 MiB 为 `a626d17da2e502f5b4b8e3ebd23f0bf9daef6255688d8e0bb482b3ae3794a682`。
+原始结果、环境变量引用配置、独立 CLI 状态及截图保存在仓库外私有目录
+`/Users/yexiyue/Downloads/waybill-oss-test-20261002-e00c45e2/`：
+`results.json`、`object.json`、`bucket-created.jpg`、`bucket-samples.jpg`。
+截图与 checkpoint 不纳入仓库。复测脚本见[对象存储接入](object-storage.zh-CN.md)。
+
+未覆盖 COS 等其他公有云、STS 刷新、版本控制桶、自然会话过期、真实完成响应丢失、
+限流、跨区域吞吐、Linux / 远端 CI 或浏览器运行端口。
+Writing checkpoint 不证明已确认任何分片；本次验证整文件重传，未新增跨进程 multipart 续传。
+
+
+## OpenDAL 架构审查与简化（2026-10-02）
+
+审查基线为 `ef07b859ce0524064bad97d7e9491c15997a66c3` 到工作区未提交的对象存储改动，
+包含新增文件；需求依据为接入计划和 DESIGN §8.3。规范轴与需求轴独立审查，再按确认问题修复。
+
+| 轴 | 确认问题与处理 |
+|---|---|
+| Standards | OSS 操作标记所需 Content-Disposition 能力漏检；统一标记模块中的能力检查、writer 属性与归属判断，并测试能力被裁剪时拒绝上传 |
+| Standards | writer 顺序写入、关闭与失败取消逻辑重复；原始上传及发布回传共用准确长度核验和收尾规则 |
+| Standards | probe 的最终对账、暂存状态及条件清理混在一个分支；提取具名方法，保留清理失败不改变完成结果的约束 |
+| Spec | 操作标记与内容校验的独立 HEAD 可选择不同版本；内容验证绑定首次归属检查的 ETag，完成前复核版本和标记 |
+| Spec | 无固定源版本仍服务器 copy，可发布被替换的暂存；只有可固定非 null 源版本时复制，其余使用条件读取与条件写入 |
+
+两项版本窗口均以旧实现下失败的协议回归复现，修复后通过；固定源版本复制、发布响应丢失
+及回执复用覆盖继续保留。适配器 14 项 S3 协议测试与 2 项 OSS 无凭证测试通过。
+无默认后端构建、单 S3 feature 测试、workspace fmt / all-targets check / Clippy、
+workspace 测试及 rustdoc `-D warnings` 通过。Docker 全场景重跑通过。
+真实 OSS 在同一专用 bucket 的 `scratch/review-20261002/` 与独立状态目录重跑全部场景通过，
+包括 17 MiB、竞争发布、Unicode 空文件与 128 MiB 中断后的显式重传。一次空文件请求返回
+Retryable，重跑同一操作通过，没有因此更改恢复策略或关闭核验。
+复测后删除 10 个 scratch 对象，未发现待取消 multipart，复查未完成会话为 0，原 4 个
+samples 对象保留。结果保存在原私有证据目录下的 `review-20261002/results.json`。
+OSS 脚本增加隔离前缀用于已有 bucket 复测，脚本格式化并集中清理 key 的范围检查；
+失败诊断过滤凭证值，清理超时诊断不输出 multipart ID。
+未新增跨进程 multipart 恢复能力，未提交或推送代码。

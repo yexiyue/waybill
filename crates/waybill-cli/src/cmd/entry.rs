@@ -134,7 +134,7 @@ async fn location(
             };
             if candidates.is_empty() {
                 return Err(CliError::Message(
-                    "尚未登录；先运行 wb login gdrive 或 wb login webdav".into(),
+                    "尚未登录；先运行 wb login gdrive / webdav / object".into(),
                 ));
             }
             let rows = candidates

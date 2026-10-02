@@ -60,6 +60,11 @@ pub enum StreamStatus {
 
 /// 不支持偏移续传的上传端口；完成对账和整文件重传是不同能力。
 pub trait StreamUploadSink: Send + Sync {
+    /// 驱动在请求体之外保留的数据缓冲上界；默认不额外缓存。
+    /// 引擎从每条上传的预算中扣除该值，再确定源读取块大小。
+    fn write_buffer_size(&self) -> usize {
+        0
+    }
     /// 稳定实例身份。
     fn identity(&self) -> ServiceIdentity;
     /// 实际能力；要求 stream_upload 与 durable_upload。
@@ -133,7 +138,12 @@ impl TransferEngine {
                 "durable stream upload required",
             ));
         }
-        let read_limit = source.max_read_size().min(self.budget.chunk_size());
+        let available = self
+            .budget
+            .chunk_size()
+            .checked_sub(sink.write_buffer_size())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "upload buffer exceeds budget"))?;
+        let read_limit = source.max_read_size().min(available);
         if read_limit == 0 {
             return Err(Error::new(
                 ErrorKind::InvalidInput,

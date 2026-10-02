@@ -54,6 +54,7 @@ pub fn parse(uri: &str) -> Result<DriveUri> {
     let provider = match scheme {
         "gdrive" => ProviderKind::Gdrive,
         "webdav" => ProviderKind::Webdav,
+        "object" => ProviderKind::Object,
         _ => return Err(invalid()),
     };
     let (account, path) = rest.split_once('/').ok_or_else(invalid)?;

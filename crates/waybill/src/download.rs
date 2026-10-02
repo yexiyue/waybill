@@ -55,6 +55,11 @@ impl RemoteIdentity {
 }
 /// 逐块范围读取的云端源；宿主不冻结云对象，靠 identity 复核版本。
 pub trait DownloadSource: Send + Sync {
+    /// 返回 Vec 时，底层响应与输出同时驻留的最坏数据缓冲倍数。
+    /// 引擎按此值缩小读取块，避免协议适配产生的复制越过共享预算。
+    fn read_buffer_multiplier(&self) -> usize {
+        1
+    }
     /// 单次范围读取的最大字节数；必须非零。
     fn max_read_size(&self) -> usize;
     /// 实际能力；不支持范围读取的源在开始前被拒绝。
@@ -311,6 +316,8 @@ impl TransferEngine {
         let chunk_size = self
             .budget
             .chunk_size()
+            .checked_div(source.read_buffer_multiplier())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid read buffer multiplier"))?
             .min(source.max_read_size())
             .min(target.max_write_size());
         if chunk_size == 0 {

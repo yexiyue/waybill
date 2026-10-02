@@ -1,19 +1,21 @@
 [workspace]
 resolver = "3"
-members = ["crates/waybill", "crates/waybill-service-fs", "crates/waybill-service-gdrive", "crates/waybill-service-webdav", "crates/waybill-cli", "examples/consumer"]
+members = ["crates/waybill", "crates/waybill-service-fs", "crates/waybill-service-gdrive", "crates/waybill-service-webdav", "crates/waybill-service-opendal", "crates/waybill-cli", "examples/consumer"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yexiyue/waybill"
-rust-version = "1.88"
+rust-version = "1.91"
 
 [workspace.dependencies]
 waybill = { path = "crates/waybill" }
 waybill-service-fs = { path = "crates/waybill-service-fs" }
 waybill-service-gdrive = { path = "crates/waybill-service-gdrive" }
 waybill-service-webdav = { path = "crates/waybill-service-webdav" }
+waybill-service-opendal = { path = "crates/waybill-service-opendal" }
+opendal = { version = "=0.59.3", default-features = false, features = ["auto-register-services", "http-transport-reqwest", "executors-tokio"] }
 quick-xml = { version = "0.42", features = ["serialize"] }
 digest_auth = "0.3"
 percent-encoding = "2"

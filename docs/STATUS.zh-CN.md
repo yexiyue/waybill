@@ -6,9 +6,9 @@
 
 ## 当前状态
 
-项目处于 **0.x 开发阶段，尚未发布稳定版本**。本地与 Google Drive、WebDAV 之间的上传、
+项目处于 **0.x 开发阶段，尚未发布稳定版本**。本地与 Google Drive、WebDAV、OpenDAL 对象存储之间的上传、
 下载和持久恢复已实现；CLI 提供登录、盘配置、目录浏览、多文件传输与交互选择。
-公开 API 仍可能调整；当前直接注入 service 端口，不提供 Operator / registry。
+公开 API 仍可能调整；当前直接注入 service 端口，核心不提供自己的 Operator / registry；对象存储接受 OpenDAL Operator。
 
 | 范围 | 已实现能力 |
 |---|---|
@@ -16,6 +16,7 @@
 | 本地 service | 稳定源、范围读取、文件 checkpoint、下载暂存与校验、同文件系统无覆盖发布 |
 | GDrive service | 分块上传、偏移续传、会话与完成对象对账、目录和对象访问、范围读取下载 |
 | WebDAV service | Basic / Digest / 匿名凭证、目录和范围读取、整文件流式上传、内容对账与条件 MOVE |
+| OpenDAL service | 11 种对象存储后端配置、前缀浏览、条件范围下载、流式上传、内容对账与无覆盖发布；按能力开放 |
 | `wb` CLI | login / drive / list / put / get / status，命名盘与默认根目录，短路径、跨目录多选、全屏面板与 JSON 事件 |
 | 独立消费者 | 通过公开接口接入上传与只读 service 的示例 |
 
@@ -82,6 +83,20 @@ Windows 与浏览器没有支持承诺。真实限流、磁盘满、断电、长
 
 复现配置和服务端差异见 [WebDAV 验收记录](webdav-acceptance.zh-CN.md)。
 
+## 对象存储接入（2026-10-02）
+
+- 接入 OpenDAL 0.59.3，统一对象存储宿主配置和 `object://账户/key` URI；
+  后端列表与实际 capability 分别检查，未支持操作明确报错。
+- 条件范围下载、临时对象上传、读回 BLAKE3 校验、条件发布和完成回执已实现。
+  writer 会话不进入 checkpoint，中断后需 `--allow-restart`；暂存完成后可只重试发布。
+- 本地 RustFS Docker 覆盖 17 MiB multipart、128 MiB SIGKILL 后显式重传、内容校验、
+  回执复用、冲突、操作后缀、根目录、Unicode 与空文件。真实 OSS 同一组场景及竞争发布保护已通过；COS 尚未验收。
+- 架构审查后集中操作标记与 writer 生命周期；归属及内容检查绑定同一版本，
+  服务器 copy 必须固定非 null 源版本，否则使用条件读回与重上传。
+- 基线 Rust 1.91；默认数据预算 32 MiB，包含适配器的分片缓冲和范围读取复制。
+
+配置和复现见[对象存储接入](object-storage.zh-CN.md)。
+
 ## 里程碑与后续工作
 
 | 阶段 | 状态 | 范围 |
@@ -91,12 +106,12 @@ Windows 与浏览器没有支持承诺。真实限流、磁盘满、断电、长
 | M2 | 已实现并验收 | GDrive 下载、本地暂存恢复、校验与无覆盖发布 |
 | CLI | 已实现并验收上述范围 | 上传与下载闭环、盘配置、交互选择与脚本输出 |
 | M3 | 已实现；本地两套服务器验收 | WebDAV 浏览、下载、流式上传和完成对账 |
-| M4 | 计划 | OSS 经 OpenDAL 协议层接入：浏览、下载与整文件上传；multipart 分片恢复不经桥接、另行立项（见 DESIGN §8.3） |
-| OpenDAL | 按实际需求启动 | 独立可选 service，优先验证具体额外后端的下载路径 |
+| M4 | 已实现；RustFS / S3 与真实 OSS 验收 | OpenDAL 对象存储浏览、条件下载与整文件上传；不承诺 multipart 跨进程续传（见 DESIGN §8.3） |
+| OpenDAL | 已接入 0.59.3 | 独立 service；真实 OSS 已通过；COS 等其他公有云验收待补充 |
 | SwarmDrop | 计划正式接入 | 另立 OpenSpec；当前独立消费者示例不代表应用已接入 |
 
 后续优先补充恢复与资源使用的真实环境样本，并通过更多后端验证公共契约。
-OSS 与 OpenDAL 适配尚未实现，不预先创建占位 crate。
+原生 multipart 会话恢复仍需单独立项。
 API 稳定化和发布须结合双向链路、更多后端与交付验证推进。
 
 里程碑的设计依据与扩展边界见[设计文档 §7](DESIGN.zh-CN.md#7-里程碑)。

@@ -10,6 +10,14 @@ pub async fn run(
     account_override: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
+    if let Provider::Object { config } = &provider {
+        if client.is_some() || no_browser {
+            return Err(CliError::Message(
+                "对象存储配置不使用 Google 客户端或浏览器参数".into(),
+            ));
+        }
+        return crate::object_host::login(config, account_override, json).await;
+    }
     if let Provider::Webdav {
         endpoint,
         username,

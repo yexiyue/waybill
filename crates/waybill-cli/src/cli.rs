@@ -57,7 +57,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct PutInput {
-    /// 允许过期会话或中断的 WebDAV PUT 从头重传整文件。
+    /// 允许过期会话或中断的流式上传从头重传整文件。
     #[arg(long)]
     pub allow_restart: bool,
     /// 本地文件；省略时多选。末尾完整 URI 仍可用作目标。
@@ -85,7 +85,7 @@ pub struct GetInput {
 pub struct ListInput {
     /// 默认盘下的目录路径或完整 URI；省略时浏览云盘。
     pub path: Option<String>,
-    /// 临时根目录：GDrive 对象 ID 或 WebDAV 相对目录路径。
+    /// 临时根目录：GDrive 对象 ID 或 WebDAV / 对象存储相对目录路径。
     #[arg(long, value_name = "ROOT")]
     pub root: Option<String>,
     /// 禁用交互及全屏传输面板。
@@ -100,7 +100,7 @@ pub struct TransferArgs {
     /// 同名目标的处理策略。
     #[arg(long, value_enum, default_value_t = Conflict::Reject)]
     pub conflict: Conflict,
-    /// 临时根目录：GDrive 对象 ID 或 WebDAV 相对目录路径。
+    /// 临时根目录：GDrive 对象 ID 或 WebDAV / 对象存储相对目录路径。
     #[arg(long, value_name = "ROOT")]
     pub root: Option<String>,
     /// 禁用交互及全屏传输面板。
@@ -144,7 +144,7 @@ pub struct PutArgs {
     pub operation: Option<String>,
     /// 同名目标冲突策略。
     pub conflict: Conflict,
-    /// 根目录：GDrive 缺省为 root，WebDAV 缺省为 /。
+    /// 根目录：GDrive 缺省为 root，WebDAV / 对象存储缺省为 /。
     pub root: Option<String>,
     /// 禁用全屏面板，使用行式输出（非终端自动生效）。
     pub no_tui: bool,
@@ -155,6 +155,12 @@ pub struct PutArgs {
 pub enum Provider {
     /// Google Drive（读取云盘文件，创建和修改本应用文件）。
     Gdrive,
+    /// 对象存储：导入 OpenDAL 后端配置（S3 / OSS / COS 等）。
+    Object {
+        /// JSON 配置文件；使用 - 从 stdin 读取，凭证可引用 ${ENV_VAR}。
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+    },
     /// WebDAV：使用 Basic / Digest 或匿名认证。
     Webdav {
         /// 服务端根目录 URL，不包含密码。
@@ -189,7 +195,7 @@ pub struct GetArgs {
     pub operation: Option<String>,
     /// 同名本地目标冲突策略。
     pub conflict: Conflict,
-    /// 根目录：GDrive 缺省为 root，WebDAV 缺省为 /。
+    /// 根目录：GDrive 缺省为 root，WebDAV / 对象存储缺省为 /。
     pub root: Option<String>,
     /// 禁用全屏面板，使用行式输出（非终端自动生效）。
     pub no_tui: bool,
@@ -199,7 +205,7 @@ pub struct GetArgs {
 pub struct ListArgs {
     /// 目录 URI，如 gdrive://account@example.com/backup/；根目录可省略路径。
     pub uri: String,
-    /// 根目录：GDrive 缺省为 root，WebDAV 缺省为 /。
+    /// 根目录：GDrive 缺省为 root，WebDAV / 对象存储缺省为 /。
     pub root: Option<String>,
 }
 

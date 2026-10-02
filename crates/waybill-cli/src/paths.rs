@@ -17,6 +17,16 @@ impl Layout {
 
     /// 发现平台目录；HOME 缺失属于不可恢复的环境错误。
     pub fn discover() -> Result<Self> {
+        if let Some(path) = std::env::var_os("WAYBILL_STATE_DIR") {
+            let state = PathBuf::from(path);
+            if !state.is_absolute() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "WAYBILL_STATE_DIR must be absolute",
+                ));
+            }
+            return Ok(Self { state });
+        }
         let dirs = directories::ProjectDirs::from("com", "yexiyue", "waybill")
             .ok_or_else(|| Error::new(ErrorKind::Io, "platform directories unavailable"))?;
         // macOS 没有独立的 state 目录，落到 Application Support 下的 state。
@@ -40,6 +50,10 @@ impl Layout {
     /// 单个 Drive 账户的私有目录；调用方需先用 uri::safe_account 校验账户名。
     pub fn gdrive_account(&self, account: &str) -> PathBuf {
         self.state.join("credentials").join("gdrive").join(account)
+    }
+    /// 对象存储账户的私有连接设置；调用方校验账户名。
+    pub fn object_account(&self, account: &str) -> PathBuf {
+        self.state.join("credentials").join("object").join(account)
     }
     /// WebDAV 账户的私有连接设置与密码目录。
     pub fn webdav_account(&self, account: &str) -> PathBuf {

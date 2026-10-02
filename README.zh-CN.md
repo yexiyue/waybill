@@ -19,12 +19,12 @@
 waybill 为上传和下载保存持久进度与完成回执。传输中断后，重新运行同一命令，
 即可核验源文件和已保存状态，按后端策略恢复或复用完成结果。
 
-你可以用 `wb` 管理 Google Drive 与 WebDAV 文件，也可以通过 Rust 公开接口把传输能力嵌入应用。
+你可以用 `wb` 管理 Google Drive、WebDAV 与对象存储文件，也可以通过 Rust 公开接口把传输能力嵌入应用。
 项目名称来自随货同行的「运单」；[Bill · 雁哥](docs/BRAND.zh-CN.md) 是我们的邮差鸿雁。
 
 ## 功能
 
-- **双向传输**：Google Drive 与 WebDAV 上传、下载及目录浏览。
+- **双向传输**：Google Drive、WebDAV 与对象存储上传、下载及目录浏览，按后端能力开放。
 - **持久恢复**：保存 checkpoint，恢复时对账源版本、远端会话或本地暂存数据。
 - **交互选择**：命名盘、默认根目录、本地与云端文件多选，以及全屏传输面板。
 - **脚本集成**：完整参数直接执行，支持逐行 JSON 事件与行式进度。
@@ -35,7 +35,7 @@ waybill 面向文件交付；目录同步、冲突合并与多设备同步不在
 
 ## 安装
 
-支持 Linux 和 macOS，需要 **Rust 1.88 或更高版本**。从源码安装 `wb`：
+支持 Linux 和 macOS，需要 **Rust 1.91 或更高版本**。从源码安装 `wb`：
 
 ```sh
 git clone https://github.com/yexiyue/waybill.git
@@ -95,11 +95,30 @@ wb --drive nas get backup/a.zip ./a.zip
 必须用 `--allow-restart` 显式允许整文件重传；已校验暂存可只重试发布。
 服务端要求与兼容矩阵见 [WebDAV 验收记录](docs/webdav-acceptance.zh-CN.md)。
 
+### 对象存储（Apache OpenDAL）
+
+新增独立 `waybill-service-opendal`，默认启用 S3、OSS、COS、OBS、TOS、GCS、Azure Blob、
+B2、Swift、Upyun 和 Vercel Blob；库消费者可按 feature 裁剪。
+
+```sh
+wb login --account cloud object --config object.json
+wb drive add cloud --provider object --account cloud
+wb --drive cloud put ./model.bin --to models/ --no-tui
+wb --drive cloud get models/model.bin ./downloaded.bin --no-tui
+wb --drive cloud list models/ --no-tui
+```
+
+配置沿用各 OpenDAL 后端字段，支持 `${ENV}` 凭证引用。上传默认关闭；确认服务端条件写入
+有效后设置 `conditional_writes: true`。上传中断需显式允许整文件重传，已验证暂存可重试发布。
+后端名称支持不代表全部交付能力支持：当前 B2、Upyun、Vercel Blob 等缺少适配器所需条件读取，
+OBS、Swift 等缺少条件上传。RustFS / S3 本地 Docker 与阿里云 OSS 真实验收已通过；COS 等其他公有云尚未验收。
+配置示例、能力边界和复现步骤见[对象存储接入](docs/object-storage.zh-CN.md)。
+
 ## 命令与交互
 
 | 命令 | 用途 |
 |---|---|
-| `wb login gdrive / webdav` | 登录 Google Drive 或 WebDAV |
+| `wb login gdrive / webdav / object` | 登录 Google Drive、WebDAV 或导入对象存储配置 |
 | `wb drive add / list / use / root / remove` | 管理命名盘、默认盘与根目录 |
 | `wb list [PATH]` | 列出指定目录；省略路径时交互浏览 |
 | `wb put [SRC…] --to PATH` | 上传文件；缺少源或目标时交互选择 |
@@ -130,7 +149,7 @@ wb --json put ./a.zip --to backup/
 wb get backup/a.zip ./a.zip --no-tui
 ```
 
-`--drive NAME` 临时切换盘，`--root ROOT` 临时覆盖根目录（GDrive 对象 ID 或 WebDAV 相对目录）。
+`--drive NAME` 临时切换盘，`--root ROOT` 临时覆盖根目录（GDrive 对象 ID 或 WebDAV / 对象存储相对目录）。
 `wb drive use NAME` 修改默认盘；`wb drive remove NAME` 保留登录凭证和恢复记录。
 
 也可以直接指定账户与完整 URI：
@@ -140,7 +159,7 @@ wb get 'gdrive://account@example.com/backup/a.zip' ./a.zip
 wb get 'webdav://nas/backup/a.zip' ./a.zip
 ```
 
-完整 URI 从账户根目录开始（GDrive 为 Google 根目录，WebDAV 为登录端点；可用 `--root` 覆盖），不能与 `--drive` 同时使用。
+完整 URI 从账户根目录开始（GDrive 为 Google 根目录，WebDAV 为登录端点，对象存储为 Operator 配置根；可用 `--root` 覆盖），不能与 `--drive` 同时使用。
 `--json`、`--no-tui` 和非终端环境不会自动进入选择器，缺少必要参数会报错。
 具体选项见 `wb <命令> --help`。
 

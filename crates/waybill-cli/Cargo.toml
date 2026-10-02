@@ -16,6 +16,7 @@ waybill.workspace = true
 waybill-service-fs.workspace = true
 waybill-service-gdrive.workspace = true
 waybill-service-webdav.workspace = true
+waybill-service-opendal.workspace = true
 rpassword = "7"
 tokio.workspace = true
 reqwest.workspace = true

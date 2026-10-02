@@ -1,0 +1,39 @@
+[package]
+name = "waybill-service-opendal"
+description = "Object storage access and delivery through Apache OpenDAL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["object-stores"]
+object-stores = ["s3", "oss", "cos", "obs", "tos", "gcs", "azblob", "b2", "swift", "upyun", "vercel-blob"]
+s3 = ["opendal/services-s3"]
+oss = ["opendal/services-oss"]
+cos = ["opendal/services-cos"]
+obs = ["opendal/services-obs"]
+tos = ["opendal/services-tos"]
+gcs = ["opendal/services-gcs"]
+azblob = ["opendal/services-azblob"]
+b2 = ["opendal/services-b2"]
+swift = ["opendal/services-swift"]
+upyun = ["opendal/services-upyun"]
+vercel-blob = ["opendal/services-vercel-blob"]
+
+[dependencies]
+waybill.workspace = true
+opendal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+getrandom = "0.2"
+http = "1"
+
+[dev-dependencies]
+waybill-service-fs.workspace = true
+tempfile.workspace = true
+wiremock = "0.6"

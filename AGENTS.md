@@ -14,7 +14,7 @@
 
 ## 当前仓库
 
-项目处于 **M3 WebDAV 已接入并完成本地服务器矩阵验收，未发布**。M1 已交付公开上传
+项目处于 **M4 OpenDAL 对象存储已接入，本地 S3 兼容服务器与真实 OSS 验收，未发布**。M1 已交付公开上传
 契约、service-fs 稳定源与 checkpoint、service-gdrive 上传与对账，`wb` CLI
 的 login / put / status 上传侧闭环已通过真机验收。M2 下载侧（核心下载契约
 与并行引擎、GDrive 范围读取、fs `.part` 暂存与发布、`wb get` / `wb list`、盘配置与多选文件选择器）
@@ -31,6 +31,7 @@ WebDAV 已提供目录、条件范围读取、整文件流式上传与 MOVE 对�
 | `crates/waybill-service-fs/` | 稳定本地源、持久 checkpoint 与下载本地目标 |
 | `crates/waybill-service-gdrive/` | 原生 GDrive 上传协议、对账与范围读取下载 |
 | `crates/waybill-service-webdav/` | WebDAV 访问、流式上传与条件发布对账 |
+| `crates/waybill-service-opendal/` | OpenDAL 对象存储浏览、条件下载、流式上传与完成对账 |
 | `crates/waybill-cli/` | `wb` 命令行宿主：OAuth、凭证、投递与取回、面板 |
 | `examples/consumer/` | 独立公开 API 接入示例 |
 | `docs/DESIGN.zh-CN.md` | 架构、恢复语义、扩展契约与路线图 |
@@ -40,15 +41,15 @@ WebDAV 已提供目录、条件范围读取、整文件流式上传与 MOVE 对�
 | `assets/brand/` / `docs/BRAND.zh-CN.md` | Bill 吉祥物与品牌资产 |
 | `.github/workflows/ci.yml` | Linux 与 macOS 的 Rust CI |
 
-Rust edition 为 **2024**，rust-version 统一为 **1.88**（2026-10-01 起，跟随
-ratatui 等依赖族的实际下限，不再维护更低的 MSRV 承诺或独立检查），
+Rust edition 为 **2024**，rust-version 统一为 **1.91**（2026-10-02 起，跟随
+OpenDAL 0.59.3 等依赖族的实际下限，不再维护更低的 MSRV 承诺或独立检查），
 许可证为 **MIT OR Apache-2.0**。新增依赖与工具链配置以此为下限。
 
 ## 架构约束
 
 - 核心负责公开契约与交付生命周期；协议操作和本地 IO 放在各 service 中。
   核心不依赖具体 service、HTTP 客户端、SwarmDrop、Tauri 或应用身份模型。
-- 本地、GDrive、WebDAV、OSS 计划作为独立 `waybill-service-*` crate 接入。
+- 本地、GDrive、WebDAV、OpenDAL 对象存储作为独立 `waybill-service-*` crate 接入。
   开发到对应里程碑再创建，不预留空 crate 或假实现。
 - 自维护与外部 service 使用同一套公开契约。扩展 trait 不封闭，
   新增 service 无须修改核心 provider 枚举、访问私有 helper 或加入特殊分支。
@@ -56,7 +57,7 @@ ratatui 等依赖族的实际下限，不再维护更低的 MSRV 承诺或独立
   未支持的操作返回明确错误，不能用默认成功掩盖缺失实现。
 - 凭证刷新与交互授权由宿主拥有。service 在请求边界获取有效凭证；
   不把 OAuth、WebDAV 用户密码和 OSS AK / STS 强行统一成同一种凭证。
-- OpenDAL 适配按具体额外后端需求启动，优先验证下载，遵循相同公开边界。
+- OpenDAL 对象存储适配遵循相同公开边界，逐项映射实际能力。
   桥接访问成功不能代替恢复与交付保证的验收。
 - 公共端口保持平台中立；原生 IO、执行器及其保证按 target / feature 隔离。
   浏览器支持仍需单独设计和验证，不能从原生实现推断。
@@ -106,7 +107,7 @@ cargo test --workspace
 
 需要格式化时使用 `cargo fmt --all`。现有 CI 在 Linux 与 macOS 上执行
 fmt、Clippy、测试与 rustdoc，使用 stable 工具链；不设独立 MSRV 检查
-（rust-version 1.88 由依赖解析保证），尚无浏览器验收任务。
+（rust-version 1.91 由依赖解析保证），尚无浏览器验收任务。
 不要把现有 CI 通过描述为所有 target 或真实后端均已验证。
 
 真实后端验证需记录环境与能力，区分本地契约验证和服务端验收。

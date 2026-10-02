@@ -36,7 +36,8 @@ SwarmDrop 业务适配继续留在应用。当前可复用素材是已落地的 
 实现与本地文件实现。已实现本地稳定源到 GDrive 的上传恢复与云端到本地的
 下载发布；WebDAV 已实现有界目录访问、强 ETag 条件范围读取、整文件流式上传
 和条件 MOVE 发布，并通过 Apache 与 WsgiDAV 的本地 Basic / Digest 矩阵。
-OSS 仍是计划；更多服务器、代理和网络环境未验收。真实故障恢复
+对象存储已通过独立 OpenDAL service 接入，本地 RustFS / S3 与真实 OSS 已验收；COS、
+更多服务器、代理和网络环境未验收。真实故障恢复
 需独立验收，不继承 SwarmDrop 正常上传探针的结论。
 
 ## 1. 动机：三要件是怎么被逼出来的
@@ -268,8 +269,8 @@ OpenDAL 桥接层只暴露实际支持的能力，不统一假定所有后端不
 | waybill-service-fs | 本地范围读取、随机写入、暂存、同步与最终发布 | core + 原生文件实现，按 target / feature 隔离 |
 | waybill-service-gdrive | Drive 对象访问、偏移上传会话与恢复对账 | core + HTTP / 协议依赖 |
 | waybill-service-webdav | WebDAV 访问、流式上传、服务端差异与可选分块扩展 | core + WebDAV / HTTP 依赖 |
-| waybill-service-oss | OSS 访问、分片会话与恢复对账 | core + SDK 或 HTTP / 签名依赖 |
-| waybill-service-opendal（条件扩展） | 已配置 Operator 的访问与交付能力适配 | core + OpenDAL；有实际需求再创建 |
+| waybill-service-oss（未立项） | 原生 OSS 分片会话与恢复对账 | core + SDK 或 HTTP / 签名依赖 |
+| waybill-service-opendal | 已配置 Operator 的对象存储访问与交付能力适配 | core + OpenDAL 0.59.3 |
 | 外部 service crate | 新后端或现有后端的其他实现 | core + 自选协议依赖；可以独立发布 |
 
 ```mermaid
@@ -278,8 +279,8 @@ flowchart TB
     APP --> FS["service-fs"]
     APP --> GD["service-gdrive"]
     APP --> WD["service-webdav"]
-    APP --> OSS["service-oss"]
-    APP --> EXT["外部 service / 可选 service-opendal"]
+    APP --> OSS["service-opendal：对象存储"]
+    APP --> EXT["外部 service / 原生分片扩展"]
     FS --> CORE
     GD --> CORE
     WD --> CORE
@@ -311,7 +312,7 @@ flowchart TB
 |---|---|---|---|
 | Google Drive | resumable session URI + 服务器字节数查询 | 完成后确认对象，响应丢失时重新查询 | appProperties 回执键与对象 ID 对账 |
 | 普通 WebDAV | 重试重传整文件；Nextcloud 等扩展另行声明 | PUT 临时对象 → MOVE，实际保证按服务端验收 | 操作对应路径、长度 / ETag 等证据；无可信哈希时不宣称内容一致 |
-| OSS | multipart upload_id + ListParts 对账 | CompleteMultipartUpload 后查询完成状态 | 确定性 key + 操作身份 / 预期校验和 / 对象版本，不能只凭同 key |
+| 原生 OSS（未立项） | multipart upload_id + ListParts 对账 | CompleteMultipartUpload 后查询完成状态 | 确定性 key + 操作身份 / 预期校验和 / 对象版本，不能只凭同 key |
 
 ### 5.5 云端 → 本地：恢复与发布生命周期
 
@@ -439,17 +440,17 @@ flowchart LR
 .part 恢复与本地发布"]
     M2 --> M3["M3 WebDAV
 流式上传与真实服务端矩阵"]
-    M3 --> M4["M4 OSS 接入：OpenDAL 协议层
+    M3 --> M4["M4 对象存储接入：OpenDAL 协议层
 浏览下载与整文件上传；分片恢复另立项"]
     M1 -.-> APP["SwarmDrop 正式回接
 另立 OpenSpec"]
-    NEED["额外后端的实际需求"] -.-> OD["可选 OpenDAL service"]
+    NEED["额外后端的实际需求"] -.-> M4
 ```
 
 M1 交付独立库与公开 API 消费者示例，不替换 SwarmDrop 主线。首期验证 Linux / macOS，
-rust-version 1.88（2026-10-01 起统一，不再维护更低版本）。API 仍为 0.x 原型；完整稳定化须经过双向链路与更多后端验证。
+rust-version 1.91（2026-10-02 起，跟随 OpenDAL 依赖下限）。API 仍为 0.x 原型；完整稳定化须经过双向链路与更多后端验证。
 真实 GDrive 重启、会话过期及完成响应丢失测试与本地 HTTP 替身测试分别记录。
-M4 的形态见 §8.3：OpenDAL 承担 OSS 协议层，分片恢复不经桥接、另行立项。
+M4 的形态见 §8.3：OpenDAL 承担对象存储协议层，分片恢复不经桥接、另行立项。
 
 ## 8. 与 OpenDAL 的关系（三重）
 
@@ -502,23 +503,43 @@ WebDAV 轮的验收与云端盘差异（见 [webdav-acceptance](webdav-acceptanc
 最低（上游也在与同样的差异搏斗，且默认宽松行为会绕开本库钉死的请求形状
 控制，如不为认证发空 PUT、挑战断连与重定向白名单）。
 
-对 OSS / S3 系的既定路线：
+2026-10-02 的 M4 实现采用独立 `waybill-service-opendal`（OpenDAL 0.59.3）：
 
-- **下载与浏览**：全量走桥接。范围读取 + stat（ETag 作不透明 revision），
-  恢复状态由本地引擎拥有，区间账本与 `.part` 机制不变。
-- **上传**：仅整文件流式语义，复用 StreamUploadSink 模式（临时 key 写入、
-  读回校验、copy 发布）。条件 copy（`CopySource-If-Match`）未在 OpenDAL
-  公开契约确认暴露，发布保证按 C 档声明（见 §10 分级），或为该请求手写。
-- **分片恢复不经桥接**：§11 已记录 OpenDAL MultipartWriter 的上传 ID 为
-  私有状态，跨进程续传拿不出来。若做，则手写 OSS multipart（持久化
-  upload_id 与 part ETags，ListParts 对账），单独立项，OpenDAL 不参与。
+- **统一配置**：宿主注入 Operator；CLI 的 `object` provider 导入后端名与原生 options。
+  默认启用 s3、oss、cos、obs、tos、gcs、azblob、b2、swift、upyun、vercel-blob，
+  库可裁剪 feature。注册后端与 waybill 生命周期能力分别表达，不为缺失能力提供假实现。
+- **下载与浏览**：前缀作为虚拟目录；恢复下载必须有 stat、强 ETag 与条件范围读取。
+  HTTP 层核验 206、Content-Range、响应 ETag 和实际字节上限；ETag 仅作不透明 revision。
+  B2 / Upyun / Vercel Blob 等当前无法满足条件读取，不提供该下载端口。
+- **上传**：必须声明条件创建、用户元数据、多次 writer 写入、空文件及上述下载能力；
+  `conditional_writes` 默认 false，宿主确认服务端和 bucket 条件写入有效后才能启用。
+  OSS / COS 版本控制可能影响防覆盖保证，不能凭 capability 推断配置正确。
+  写入随机临时 key，操作标记绑定身份，读回校验 BLAKE3；具备条件 copy 且可固定非 null 源版本时服务器复制，
+  否则有界读回并再次条件上传到最终 key，后者增加完整上传流量。
+  最终对象按标记、长度、版本与内容对账后才形成 Digest 回执；标记检查、条件读取
+  与校验后的元数据复核须绑定同一版本，不能在独立 HEAD 之间重新选择对象。
+  OpenDAL 0.59.3 的 OSS multipart 初始化未发送用户元数据，因此 OSS 额外通过
+  `Content-Disposition: inline; waybill-delivery="<标记>"` 保存操作身份；该扩展参数由
+  OpenDAL 在签名前设置。不得在待对账期间移除此属性，否则无法确认对象归属。
+- **恢复与清理**：checkpoint 保存操作绑定、临时 / 最终 key、阶段与暂存 revision，
+  不保存凭证或 OpenDAL 私有 multipart upload ID。中断写入默认保留记录并拒绝重传，
+  只有显式允许才整文件重建；已校验暂存可重试发布，完成响应丢失可对账最终对象。
+  确认最终内容后仅对支持条件删除的后端清理当前暂存；未知结果和中断孤儿由 bucket
+  lifecycle 处理（包括未完成 multipart），不擅自批量删除。
+- **资源**：默认两个操作，每操作 16 MiB 数据预算。stream writer 预留两倍最小分片
+  （协议缓存及填充块），内部并发固定 1；源读取使用剩余预算。
+  下载通过 `read_buffer_multiplier = 2` 计入连续块复制，单范围最多 8 MiB。
+  元数据响应最多 1 MiB、目录最多 1000 项，HTTP 请求含正文总时限 60 秒。
+  宿主原生 `operator()` 操作不经过 waybill 预算或交付生命周期。
+- **依赖基线**：Rust 下限调整至 1.91；既有 reqwest =0.12.28 保留，OpenDAL 的
+  reqwest 0.13.5 独立解析。核心仍不依赖 OpenDAL、HTTP 或 Tokio。
 
-启动前置核对：OpenDAL 依赖树的 reqwest 版本与本仓 `=0.12.28` 锁是否兼容、
-其 MSRV 对 1.88 底线、§8.2 的预算叠加（内部并发计入 `chunk × concurrency`
-上界）。桥接访问通过不等于恢复与交付验收，真实后端矩阵照跑。
-
-触发条件二选一即启动评估：M4 / OSS 实际需求落地，或第三、第四台行为
-分歧的真实服务器进入兼容矩阵、quirk 维护成本实付。
+本地 RustFS / S3 Docker 与协议故障替身分别验收；11 种后端注册不代表公有云矩阵通过。
+真实 OSS 的未启用版本控制桶已验收；COS、STS 轮换和版本控制桶需补充验收。原生 multipart 分片跨进程续传仍单独立项，
+优先服务当前 SwarmDrop / agent 的云存储需求。操作指南见[对象存储接入](object-storage.zh-CN.md)。
+源码依据与核对日期：2026-10-02；参照 [OpenDAL 0.59.3](https://opendal.apache.org/docs/rust/opendal/)、
+[OSS 配置](https://opendal.apache.org/docs/rust/opendal/services/struct.Oss.html)、
+[COS 配置](https://opendal.apache.org/docs/rust/opendal/services/struct.Cos.html)。
 
 ## 9. 风险明账
 
@@ -588,7 +609,8 @@ WebDAV 轮的验收与云端盘差异（见 [webdav-acceptance](webdav-acceptanc
   对象 ID 再初始化上传；远端完成后先保存回执，消费者确认记账后才清理恢复记录。
 - 会话过期先查完成对象；未完成默认返回 SessionExpired 并保留记录。显式允许
   重建时每次运行最多两次，进度表达重新开始。暂停停止后续块，先对账在途结果。
-- 默认上传块 8 MiB，共享预算最多两条上传、16 MiB 数据缓冲；校验块 256 KiB，
+- 2026-10-02 默认每操作 16 MiB，共享预算最多两个操作、32 MiB 数据缓冲；
+  Drive 单块仍最多 8 MiB，OpenDAL 预留协议缓冲，校验块 256 KiB，
   单个元数据响应及 checkpoint 上限 1 MiB，元数据列表最多 1000 项。无目录缓存。
   GDrive HTTP 超时 60 秒；限流 / 5xx 最多三次重试、单次等待最多 30 秒。
   WebDAV 普通请求默认 60 秒总时限，整文件 PUT 默认一小时，两者可由宿主调整；
@@ -754,7 +776,8 @@ MIT 来源声明随衍生代码保留。
 只复用协议和恢复机制，不复制设备目录、接收记录模型、CloudAccountManager 或 UI 类型。
 SwarmDrop 的 17 MiB 真机探针确认正常分块上传、属性查询及重复接收复用；重启、过期、
 完成响应丢失尚未验收。目录源码的 let chains 当时为兼容 Rust 1.85 改写；
-2026-10-01 起 rust-version 统一为 1.88，新代码可直接使用 let chains。
+2026-10-01 起 rust-version 统一为 1.88，新代码可直接使用 let chains；
+2026-10-02 接入 OpenDAL 0.59.3 后调整至 1.91。
 
 本轮源码复核：本机缓存 OpenDAL core 0.59.2 的 MultipartWriter 上传 ID 为私有状态；
 [公开 GDrive backend](https://opendal.apache.org/docs/rust/src/opendal_service_gdrive/backend.rs.html)

@@ -20,13 +20,13 @@ waybill saves durable progress and completion receipts for uploads and downloads
 After an interruption, rerun the same command to validate the source and saved
 state, then resume according to the backend policy or reuse the completed result.
 
-Use `wb` to manage Google Drive and WebDAV files, or embed transfers through
+Use `wb` to manage Google Drive, WebDAV, and object storage files, or embed transfers through
 the public Rust interfaces. The name comes from the document that travels with a
 shipment; [Bill](docs/BRAND.zh-CN.md) is our courier goose.
 
 ## Features
 
-- **Two-way transfers**: Google Drive and WebDAV uploads, downloads, and directory browsing.
+- **Two-way transfers**: Google Drive, WebDAV, and object storage uploads, downloads, and directory browsing, subject to backend capabilities.
 - **Durable recovery**: checkpoints reconcile source versions, remote sessions, or local staging data before resuming.
 - **Interactive selection**: named drives, default roots, local and cloud file selection, and a fullscreen transfer dashboard.
 - **Scripting**: complete arguments run directly, with line-delimited JSON events and plain progress output.
@@ -38,7 +38,7 @@ multi-device synchronization are outside the current feature set.
 
 ## Installation
 
-Supports Linux and macOS. Requires **Rust 1.88 or newer**. Install `wb` from source:
+Supports Linux and macOS. Requires **Rust 1.91 or newer**. Install `wb` from source:
 
 ```sh
 git clone https://github.com/yexiyue/waybill.git
@@ -103,11 +103,32 @@ require `--allow-restart` to retransmit the whole file. Verified staging can ret
 publication alone. See the [WebDAV validation notes](docs/webdav-acceptance.zh-CN.md)
 for server requirements and the tested matrix.
 
+### Object storage (Apache OpenDAL)
+
+`waybill-service-opendal` enables S3, OSS, COS, OBS, TOS, GCS, Azure Blob,
+B2, Swift, Upyun, and Vercel Blob by default. Library consumers can select individual features.
+
+```sh
+wb login --account cloud object --config object.json
+wb drive add cloud --provider object --account cloud
+wb --drive cloud put ./model.bin --to models/ --no-tui
+wb --drive cloud get models/model.bin ./downloaded.bin --no-tui
+wb --drive cloud list models/ --no-tui
+```
+
+Configuration uses OpenDAL backend keys and supports `${ENV}` credential references.
+Uploads require `conditional_writes: true` after confirming the server enforces conditional creation.
+Interrupted uploads require explicit whole-file restart; verified staging can retry publication.
+Backend registration does not imply every delivery capability: B2, Upyun, and Vercel Blob lack
+required conditional reads; OBS and Swift lack required conditional uploads in this adapter.
+Local RustFS / S3 Docker and real Aliyun OSS acceptance passed; COS and other public-cloud backends remain pending.
+See the [configuration and acceptance guide](docs/object-storage.zh-CN.md).
+
 ## Commands and interaction
 
 | Command | Purpose |
 |---|---|
-| `wb login gdrive / webdav` | Sign in to Google Drive or WebDAV |
+| `wb login gdrive / webdav / object` | Sign in or import an object storage configuration |
 | `wb drive add / list / use / root / remove` | Manage named drives, the default drive, and roots |
 | `wb list [PATH]` | List a directory, or browse interactively without a path |
 | `wb put [SRC…] --to PATH` | Upload files; select missing sources or destinations interactively |
@@ -141,7 +162,7 @@ wb get backup/a.zip ./a.zip --no-tui
 ```
 
 `--drive NAME` selects a drive; `--root ROOT` overrides its root
-(a GDrive object ID or relative WebDAV directory).
+(a GDrive object ID or relative WebDAV / object storage directory).
 `wb drive use NAME` changes the default. `wb drive remove NAME` keeps credentials
 and recovery records.
 
@@ -152,7 +173,7 @@ wb get 'gdrive://account@example.com/backup/a.zip' ./a.zip
 wb get 'webdav://nas/backup/a.zip' ./a.zip
 ```
 
-Full URIs start at the account root (Google root or WebDAV endpoint) unless
+Full URIs start at the account root (Google root, WebDAV endpoint, or configured object storage root) unless
 overridden with `--root`, and cannot be
 combined with `--drive`. JSON output, `--no-tui`, and non-terminal sessions never
 open a picker; missing required arguments produce an error. See

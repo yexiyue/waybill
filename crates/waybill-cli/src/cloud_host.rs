@@ -19,6 +19,7 @@ pub(crate) async fn build(
             crate::gdrive_host::build(layout, account, root).await?,
         )),
         ProviderKind::Webdav => Ok(Arc::new(crate::webdav_host::build(layout, account, root)?)),
+        ProviderKind::Object => Ok(Arc::new(crate::object_host::build(layout, account, root)?)),
     }
 }
 /// 浏览结果的引用相对当前根；GDrive 的目录 ID 则是绝对引用。
@@ -38,6 +39,7 @@ pub(crate) fn accounts(layout: &Layout) -> Result<Vec<(String, Drive)>, CliError
     for (provider, sample) in [
         (ProviderKind::Gdrive, layout.gdrive_account("placeholder")),
         (ProviderKind::Webdav, layout.webdav_account("placeholder")),
+        (ProviderKind::Object, layout.object_account("placeholder")),
     ] {
         let directory = sample
             .parent()
